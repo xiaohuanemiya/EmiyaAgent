@@ -1,0 +1,37 @@
+[project]
+name = "emiya-agent"
+version = "0.1.0"
+description = "EmiyaAgent — 多智能体 AI 编程助手：中文需求 → 英文执行 → 中文回报"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.116",
+    "openai>=1.60",
+    "mcp>=1.13",
+    "rich>=13.9",
+    "prompt-toolkit>=3.0.48",
+    "pydantic>=2.9",
+    "tomlkit>=0.13",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+emiya = "emiya_agent.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["emiya_agent"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
