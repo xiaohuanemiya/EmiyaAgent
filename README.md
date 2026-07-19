@@ -97,6 +97,7 @@ $env:MINIMAX_API_KEY = "..."          # 设 key
 | `/memory` | 查看项目记忆 |
 | `/compact` | 立即压缩上下文 |
 | `/sessions` `/resume [ID]` | 历史会话 / 恢复会话 |
+| `/approval ask\|auto` | 工具审批：ask 时 shell/写文件/MCP 执行前须确认（默认） |
 | `/config` | 生效配置与 key 状态 |
 | `/clear` | 清空对话上下文 |
 | `/exit` | 退出 |
@@ -164,10 +165,26 @@ description: 部署本项目到生产环境的完整流程
 ...
 ```
 
+## 一次性执行模式
+
+```powershell
+uv run emiya -p "列出本目录的 Python 文件并统计行数"
+```
+
+执行一轮后退出（直通执行、工具自动放行），适合脚本化调用与冒烟验证。
+
+## 安全
+
+- 默认 `tool_approval = "ask"`：shell / 写文件 / 编辑 / MCP 工具执行前展示命令与参数，
+  y 允许（回车）/ n 拒绝 / a 本会话全部放行。`/approval auto` 或配置可关闭。
+- 只读工具（读文件/搜索）与低危工具（todo/项目记忆）不询问。
+- 拒绝会作为错误结果反馈给模型，它会调整方案而不是中断任务。
+
 ## 开发
 
 ```powershell
-uv run pytest          # 95 项单测：格式转换/循环不变量/管线状态机/压缩切分等
+uv run pytest          # 131 项单测：格式转换/循环不变量/管线状态机/压缩切分/审批门控等
+uv run ruff check .    # lint
 ```
 
 架构要点见 [AGENT.md](AGENT.md)；完整设计计划见开发会话的 plan 文件。

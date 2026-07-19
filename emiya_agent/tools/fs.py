@@ -1,7 +1,11 @@
-"""文件系统工具：read_file / write_file / list_dir。统一 UTF-8。"""
+"""文件系统工具：read_file / write_file / list_dir。统一 UTF-8。
+
+磁盘 IO 一律走 asyncio.to_thread，避免大文件阻塞事件循环（影响并行工具）。
+"""
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, ClassVar
 
 from emiya_agent.tools.base import Tool, ToolContext, ToolResult, resolve_path
@@ -32,7 +36,7 @@ class ReadFileTool(Tool):
         if not path.is_file():
             return ToolResult(content=f"Error: 文件不存在: {path}", is_error=True)
         try:
-            text = path.read_text(encoding="utf-8")
+            text = await asyncio.to_thread(path.read_text, encoding="utf-8")
         except UnicodeDecodeError:
             return ToolResult(
                 content=f"Error: {path} 不是 UTF-8 文本文件（可能是二进制）",
@@ -74,9 +78,13 @@ class WriteFileTool(Tool):
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         path = resolve_path(ctx, args["path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
         content = args["content"]
-        path.write_text(content, encoding="utf-8", newline="\n")
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8", newline="\n")
+
+        await asyncio.to_thread(_write)
         return ToolResult(content=f"已写入 {path}（{len(content)} 字符）")
 
 
@@ -95,8 +103,8 @@ class ListDirTool(Tool):
         path = resolve_path(ctx, args.get("path") or ".")
         if not path.is_dir():
             return ToolResult(content=f"Error: 目录不存在: {path}", is_error=True)
-        entries = sorted(
-            path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())
+        entries = await asyncio.to_thread(
+            lambda: sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
         )
         lines = [f"{e.name}/" if e.is_dir() else e.name for e in entries[:500]]
         if len(entries) > 500:

@@ -77,6 +77,20 @@ def test_thinking_blocks_dropped_on_send():
     assert msg == {"role": "assistant", "content": "ok"}
 
 
+def test_reasoning_effort_mapping():
+    from emiya_agent.providers.openai_compat import reasoning_effort_for
+
+    # OpenAI 推理模型：映射并压级
+    assert reasoning_effort_for("openai", "gpt-5.6", "high") == "high"
+    assert reasoning_effort_for("openai", "gpt-5.6", "xhigh") == "high"
+    assert reasoning_effort_for("openai", "gpt-5.6", "max") == "high"
+    assert reasoning_effort_for("openai", "o4-mini", "low") == "low"
+    # 非推理模型 / 其他供应商 / 无 effort：不发参数
+    assert reasoning_effort_for("openai", "gpt-4o", "high") is None
+    assert reasoning_effort_for("deepseek", "deepseek-chat", "high") is None
+    assert reasoning_effort_for("openai", "gpt-5.6", None) is None
+
+
 def test_tools_conversion_sorted():
     tools = [
         ToolSpec(name="b_tool", description="B", input_schema={"type": "object"}),

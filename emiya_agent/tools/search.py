@@ -44,8 +44,13 @@ class GlobTool(Tool):
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         root = resolve_path(ctx, args.get("path") or ".")
-        files = _iter_files(root, args["pattern"])
-        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        def _scan() -> list:
+            files = _iter_files(root, args["pattern"])
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return files
+
+        files = await asyncio.to_thread(_scan)  # 大目录树遍历不阻塞事件循环
         if not files:
             return ToolResult(content="(no matches)")
         lines = [str(p) for p in files[:MAX_FILES]]
@@ -79,7 +84,7 @@ class GrepTool(Tool):
         rg = shutil.which("rg")
         if rg:
             return await self._rg(rg, pattern, root, file_glob)
-        return self._python_grep(pattern, root, file_glob)
+        return await asyncio.to_thread(self._python_grep, pattern, root, file_glob)
 
     async def _rg(
         self, rg: str, pattern: str, root: Path, file_glob: str | None

@@ -1,8 +1,9 @@
-"""共享测试基建：FakeProvider（脚本化回合）、FakeUI、静默渲染。"""
+"""共享测试基建：FakeProvider（脚本化回合）、FakeUI、静默渲染、用户配置隔离。"""
 
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from typing import AsyncIterator
 
 import pytest
@@ -16,6 +17,17 @@ from emiya_agent.providers.base import (
     StreamEvent,
 )
 from emiya_agent.types import Message, Usage
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_config(tmp_path_factory, monkeypatch):
+    """所有测试与真实 ~/.emiyacode 隔离。
+
+    用户真实使用本工具后 ~/.emiyacode/config.toml 会存在（含 key/路由），
+    不隔离会让依赖默认值的测试整体被污染。"""
+    fake_home = tmp_path_factory.mktemp("fake_home")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    return fake_home
 
 
 class FakeProvider(Provider):
@@ -45,10 +57,16 @@ def assistant_turn(
 
 
 class FakeUI:
-    def __init__(self, answers: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        answers: list[str] | None = None,
+        approvals: list[bool] | None = None,
+    ) -> None:
         self.answers = list(answers or [])
+        self.approvals = list(approvals or [])  # 空 → 默认全部允许
         self.questions: list[str] = []
         self.notifications: list[str] = []
+        self.approval_requests: list[str] = []
 
     async def ask(self, question: str, options: list[str] | None = None) -> str:
         self.questions.append(question)
@@ -56,6 +74,10 @@ class FakeUI:
 
     def notify(self, text: str) -> None:
         self.notifications.append(text)
+
+    async def confirm_tool(self, name: str, args_brief: str) -> bool:
+        self.approval_requests.append(name)
+        return self.approvals.pop(0) if self.approvals else True
 
 
 @pytest.fixture

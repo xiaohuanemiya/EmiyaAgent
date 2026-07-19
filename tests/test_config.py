@@ -76,3 +76,30 @@ def test_route_missing_role(tmp_path: Path):
 def test_defaults_models_have_context_windows():
     for route, info in DEFAULTS["models"].items():
         assert info["context_window"] > 0, route
+
+
+def test_broken_config_file_does_not_block_startup(tmp_path: Path):
+    """配置文件损坏 → 跳过该层 + 记录警告，其余默认值照常生效。"""
+    d = tmp_path / ".emiyacode"
+    d.mkdir()
+    (d / "config.toml").write_text("this is [ not valid toml =", encoding="utf-8")
+    cfg = load_config(tmp_path)
+    assert cfg.routes["executor"] == "anthropic/claude-fable-5"  # 默认仍在
+    assert len(cfg.load_warnings) == 1
+    assert "已被忽略" in cfg.load_warnings[0]
+
+
+def test_usage_tracker_last_for_route(tmp_path: Path):
+    """压缩触发必须用执行器自己的 usage，不被其他角色的调用覆盖。"""
+    from emiya_agent.agent.usage import UsageTracker
+    from emiya_agent.types import Usage
+
+    tracker = UsageTracker(load_config(tmp_path))
+    tracker.add("anthropic/claude-fable-5", Usage(input_tokens=800_000))
+    tracker.add("deepseek/deepseek-chat", Usage(input_tokens=500))  # 回译调用
+
+    # 全局 last_usage 已被翻译调用覆盖……
+    assert tracker.last_usage.input_tokens == 500
+    # ……但执行器路由的 last_for 仍是自己的
+    assert tracker.last_for("anthropic/claude-fable-5").input_tokens == 800_000
+    assert tracker.last_for("never-used/route").input_tokens == 0

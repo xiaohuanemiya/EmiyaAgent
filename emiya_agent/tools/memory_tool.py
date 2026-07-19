@@ -34,6 +34,8 @@ class MemoryTool(Tool):
         "required": ["action"],
     }
     read_only: ClassVar[bool] = False  # write/delete 有副作用
+    # 只写 .emiyacode/memory/ 且有路径穿越防护，低危豁免审批
+    requires_approval: ClassVar[bool | None] = False
 
     def __init__(self, manager: MemoryManager) -> None:
         self._mm = manager

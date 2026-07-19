@@ -14,13 +14,21 @@ import asyncio
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from emiya_agent.errors import ProviderError
 from emiya_agent.providers.base import ChatRequest, MessageDone, Provider
 from emiya_agent.tools.base import ToolContext
 from emiya_agent.tools.registry import ToolRegistry
 from emiya_agent.types import Message, ToolResultBlock, ToolUseBlock, Usage
 
 INTERRUPTED_NOTE = "Interrupted by user"
+DENIED_NOTE = "User denied this tool call"
+
+
+def _args_brief(call: ToolUseBlock, limit: int = 200) -> str:
+    parts = []
+    for k, v in call.input.items():
+        s = str(v).replace("\n", "\\n")
+        parts.append(f"{k}={s[:limit]}")
+    return ", ".join(parts)
 
 # 渲染回调：消费一次流式请求，返回 MessageDone（REPL 注入 StreamRenderer.render）
 RenderFn = Callable[..., Awaitable[MessageDone]]
@@ -145,6 +153,21 @@ class AgentLoop:
             if interrupted or ctx.cancel.is_set():
                 break
             try:
+                # 审批门控：写操作/shell/MCP 在 ask 模式下须用户确认
+                if (
+                    ctx.config.tool_approval == "ask"
+                    and self.tools.needs_approval(call.name)
+                ):
+                    approved = await ctx.ui.confirm_tool(
+                        call.name, _args_brief(call)
+                    )
+                    if not approved:
+                        res = ToolResultBlock(
+                            tool_use_id=call.id, content=DENIED_NOTE, is_error=True
+                        )
+                        results[call.id] = res
+                        self.on_tool_result(call, res)
+                        continue
                 res = await self.tools.dispatch(call, ctx)
                 results[call.id] = res
                 self.on_tool_result(call, res)

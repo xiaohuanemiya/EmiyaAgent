@@ -151,6 +151,29 @@ class Repl:
         """todo_write 等工具的进度展示。"""
         panels.print_todos(self.console, text)
 
+    async def confirm_tool(self, name: str, args_brief: str) -> bool:
+        """写操作审批（tool_approval = "ask" 时）。a = 本会话改为全部放行。"""
+        self.console.print(
+            Panel(
+                f"[bold]{name}[/bold]\n{args_brief}",
+                title="执行确认",
+                border_style="yellow",
+            )
+        )
+        try:
+            answer = (
+                await self.read_line("[y]允许(回车)  [n]拒绝  [a]本会话全部允许 > ")
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return False
+        if answer in ("a", "always", "全部"):
+            self.config.tool_approval = "auto"
+            self.console.print(
+                "[dim]本会话切换为自动放行（/approval ask 可改回）。[/dim]"
+            )
+            return True
+        return answer in ("", "y", "yes", "是")
+
     # ------------------------------------------------------------- 主循环
 
     async def run(self) -> None:
@@ -162,6 +185,15 @@ class Repl:
         finally:
             await self.mcp.stop_all()  # 确保 stdio 子进程被终止
         self.console.print("[dim]再见。[/dim]")
+
+    async def one_shot(self, text: str) -> None:
+        """emiya -p "...": 执行一轮后退出（直通执行，非交互 → 自动放行工具）。"""
+        self.config.tool_approval = "auto"
+        try:
+            await self._connect_mcp()
+            await self._execute_turn(text)
+        finally:
+            await self.mcp.stop_all()
 
     async def _maybe_first_run_init(self) -> None:
         """首次运行（无任何配置文件）且交互式终端时，询问是否初始化。"""
@@ -229,6 +261,8 @@ class Repl:
             f"[bold magenta]EmiyaAgent[/bold magenta] v{__version__}  ·  "
             f"执行模型 [bold]{self.route}[/bold]  ·  {mode}  ·  /help 查看命令"
         )
+        for warning in self.config.load_warnings:
+            self.console.print(f"[yellow]⚠ {warning}[/yellow]")
         missing = [
             f"{name}({self.config.providers[name].api_key_env})"
             for name, ok in self.config.key_status().items()
@@ -267,7 +301,7 @@ class Repl:
         """超阈值自动压缩；force=True 为 /compact 手动触发。"""
         window = self.config.model_info(self.route).context_window
         if not force and not self.compactor.should_compact(
-            self.usage.last_usage, window
+            self.usage.last_for(self.route), window
         ):
             return
         head, _ = self.compactor.split(self.messages)

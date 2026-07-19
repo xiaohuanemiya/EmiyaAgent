@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, ClassVar
 
 import pytest
@@ -256,6 +255,96 @@ async def test_refusal_not_appended(tmp_path, config, quiet_console):
     assert result.stop_reason == "refusal"
     assert result.refusal == "cyber: blocked"
     assert len(messages) == 1  # 拒绝回合不入历史
+
+
+# ------------------------------------------------------------------ 审批门控
+
+
+@pytest.mark.asyncio
+async def test_approval_deny_blocks_tool(tmp_path, config, quiet_console):
+    """ask 模式下拒绝 → 工具不执行，返回 denied 错误结果，循环继续。"""
+    config.tool_approval = "ask"
+    provider = FakeProvider(
+        [
+            assistant_turn([tool_use("t1", "mark")], stop_reason="tool_use"),
+            assistant_turn([TextBlock(text="adjusted")]),
+        ]
+    )
+    loop = make_loop(provider, make_registry(WriteMarkTool()), quiet_console)
+    ui = FakeUI(approvals=[False])
+    ctx = ToolContext(cwd=tmp_path, config=config, ui=ui)
+    messages = [user_message("go")]
+    result = await loop.run(messages, system="s", ctx=ctx)
+
+    assert result.final_text == "adjusted"
+    assert ui.approval_requests == ["mark"]
+    (tr,) = [b for b in messages[2].content if isinstance(b, ToolResultBlock)]
+    assert tr.is_error
+    from emiya_agent.agent.loop import DENIED_NOTE
+
+    assert DENIED_NOTE in tr.content
+
+
+@pytest.mark.asyncio
+async def test_approval_allow_executes(tmp_path, config, quiet_console):
+    config.tool_approval = "ask"
+    provider = FakeProvider(
+        [
+            assistant_turn([tool_use("t1", "mark")], stop_reason="tool_use"),
+            assistant_turn([TextBlock(text="done")]),
+        ]
+    )
+    loop = make_loop(provider, make_registry(WriteMarkTool()), quiet_console)
+    ui = FakeUI(approvals=[True])
+    ctx = ToolContext(cwd=tmp_path, config=config, ui=ui)
+    messages = [user_message("go")]
+    await loop.run(messages, system="s", ctx=ctx)
+    (tr,) = [b for b in messages[2].content if isinstance(b, ToolResultBlock)]
+    assert not tr.is_error and tr.content == "marked"
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_skips_approval(tmp_path, config, quiet_console):
+    config.tool_approval = "auto"
+    provider = FakeProvider(
+        [
+            assistant_turn([tool_use("t1", "mark")], stop_reason="tool_use"),
+            assistant_turn([TextBlock(text="done")]),
+        ]
+    )
+    loop = make_loop(provider, make_registry(WriteMarkTool()), quiet_console)
+    ui = FakeUI()
+    ctx = ToolContext(cwd=tmp_path, config=config, ui=ui)
+    await loop.run([user_message("go")], system="s", ctx=ctx)
+    assert ui.approval_requests == []  # 未询问
+
+
+@pytest.mark.asyncio
+async def test_read_only_tools_never_ask(tmp_path, config, quiet_console):
+    config.tool_approval = "ask"
+    provider = FakeProvider(
+        [
+            assistant_turn([tool_use("t1", "echo", text="x")], stop_reason="tool_use"),
+            assistant_turn([TextBlock(text="done")]),
+        ]
+    )
+    loop = make_loop(provider, make_registry(EchoTool()), quiet_console)
+    ui = FakeUI()
+    ctx = ToolContext(cwd=tmp_path, config=config, ui=ui)
+    await loop.run([user_message("go")], system="s", ctx=ctx)
+    assert ui.approval_requests == []
+
+
+def test_exempt_tools_do_not_require_approval():
+    from emiya_agent.tools import build_default_registry
+
+    reg = build_default_registry()
+    assert reg.needs_approval("shell")
+    assert reg.needs_approval("write_file")
+    assert reg.needs_approval("edit_file")
+    assert not reg.needs_approval("read_file")
+    assert not reg.needs_approval("todo_write")  # 显式豁免
+    assert not reg.needs_approval("grep")
 
 
 # ------------------------------------------------------------------ 回调

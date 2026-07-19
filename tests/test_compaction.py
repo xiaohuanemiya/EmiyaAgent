@@ -4,7 +4,6 @@ import pytest
 
 from emiya_agent.compaction.manager import (
     COMPACT_MARKER,
-    COMPACT_SYSTEM,
     CompactionManager,
     serialize_messages,
 )

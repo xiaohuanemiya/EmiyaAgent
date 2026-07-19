@@ -23,6 +23,8 @@ class UIBridge(Protocol):
 
     def notify(self, text: str) -> None: ...
 
+    async def confirm_tool(self, name: str, args_brief: str) -> bool: ...
+
 
 @dataclass
 class ToolContext:
@@ -44,6 +46,8 @@ class Tool(ABC):
     input_schema: ClassVar[dict[str, Any]]
     read_only: ClassVar[bool] = False  # 只读 ⇒ explore 子agent可用
     interactive: ClassVar[bool] = False  # 交互式 ⇒ 永不并行（会抢终端输入）
+    # 审批门控：None = 跟随 not read_only；显式 False 可豁免（todo/memory 等低危写）
+    requires_approval: ClassVar[bool | None] = None
 
     @abstractmethod
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult: ...

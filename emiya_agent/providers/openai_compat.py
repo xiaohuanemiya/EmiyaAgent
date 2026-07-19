@@ -48,6 +48,24 @@ _THINKING_INDEX = 0
 _TEXT_INDEX = 1
 _TOOL_INDEX_BASE = 2
 
+# 内部 effort → OpenAI reasoning_effort（仅 gpt-5/o 系推理模型支持）
+_REASONING_EFFORT_MAP = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+
+
+def reasoning_effort_for(provider_name: str, model: str, effort: str | None) -> str | None:
+    """OpenAI 官方推理模型才映射 effort；其余供应商/模型不发该参数（避免 400）。"""
+    if provider_name != "openai" or not effort:
+        return None
+    if not model.startswith(("gpt-5", "o1", "o3", "o4")):
+        return None
+    return _REASONING_EFFORT_MAP.get(effort)
+
 
 def to_openai_messages(req: ChatRequest) -> list[dict[str, Any]]:
     msgs: list[dict[str, Any]] = []
@@ -247,6 +265,9 @@ class OpenAICompatProvider(Provider):
             kwargs["max_completion_tokens"] = req.max_tokens
         else:
             kwargs["max_tokens"] = req.max_tokens
+        reasoning = reasoning_effort_for(self.name, req.model, req.effort)
+        if reasoning:
+            kwargs["reasoning_effort"] = reasoning
 
         agg = ChunkAggregator()
         try:

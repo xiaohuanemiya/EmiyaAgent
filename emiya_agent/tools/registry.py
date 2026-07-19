@@ -48,6 +48,14 @@ class ToolRegistry:
         tool = self._tools.get(name)
         return tool is not None and tool.read_only and not tool.interactive
 
+    def needs_approval(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        if tool is None:
+            return False
+        if tool.requires_approval is not None:
+            return tool.requires_approval
+        return not tool.read_only
+
     async def dispatch(self, call: ToolUseBlock, ctx: ToolContext) -> ToolResultBlock:
         """执行一个工具调用；任何异常都转为 is_error 结果，绝不向上抛。"""
         tool = self._tools.get(call.name)

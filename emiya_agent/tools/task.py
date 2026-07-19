@@ -30,6 +30,8 @@ class SpawnSubagentTool(Tool):
     }
     read_only: ClassVar[bool] = False  # 输出流占用终端，串行执行
     interactive: ClassVar[bool] = True
+    # 子agent 本体豁免审批；其内部的写工具在子循环中各自走门控
+    requires_approval: ClassVar[bool | None] = False
 
     def __init__(self, spawner) -> None:  # SubagentSpawner（避免循环导入不标注类型）
         self._spawner = spawner

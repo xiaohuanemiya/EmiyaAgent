@@ -38,6 +38,7 @@ class TodoWriteTool(Tool):
         "required": ["todos"],
     }
     read_only: ClassVar[bool] = False
+    requires_approval: ClassVar[bool | None] = False  # 仅内部状态，低危豁免审批
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         todos = args.get("todos") or []

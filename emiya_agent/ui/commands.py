@@ -249,6 +249,26 @@ async def _config(repl: "Repl", args: str) -> bool:
     return False
 
 
+@command("approval", "工具审批模式：/approval ask（写操作须确认）| auto（直接执行）")
+async def _approval(repl: "Repl", args: str) -> bool:
+    arg = args.strip().lower()
+    if not arg:
+        mode = repl.config.tool_approval
+        desc = "写操作/shell/MCP 执行前询问" if mode == "ask" else "全部直接执行"
+        repl.console.print(f"当前审批模式: [bold]{mode}[/bold]（{desc}）")
+        return False
+    if arg not in ("ask", "auto"):
+        repl.console.print("[red]用法: /approval ask|auto[/red]")
+        return False
+    repl.config.tool_approval = arg
+    repl.console.print(
+        "已切换到 [bold]ask[/bold]：shell/写文件/MCP 执行前会请求确认"
+        if arg == "ask"
+        else "已切换到 [bold]auto[/bold]：所有工具直接执行（注意风险）"
+    )
+    return False
+
+
 @command("lang", "查看/切换语言模式：/lang zh 启用中文管线，/lang en 直通")
 async def _lang(repl: "Repl", args: str) -> bool:
     arg = args.strip().lower()

@@ -68,6 +68,7 @@ DEFAULTS: dict[str, Any] = {
     "language": "zh",  # zh: 启用翻译管线；en: 直通
     "max_tokens": 16000,
     "effort": "high",
+    "tool_approval": "ask",  # ask: 写操作/shell/MCP 执行前须确认；auto: 直接执行
     "routes": {
         "executor": "anthropic/claude-fable-5",
         "translator": "deepseek/deepseek-chat",
@@ -120,6 +121,8 @@ class Config(BaseModel):
     language: str = "zh"
     max_tokens: int = 16000
     effort: str = "high"
+    tool_approval: str = "ask"  # ask | auto
+    load_warnings: list[str] = Field(default_factory=list)  # 配置文件解析警告
     routes: dict[str, str] = Field(default_factory=dict)
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     models: dict[str, ModelInfo] = Field(default_factory=dict)
@@ -318,13 +321,21 @@ def remove_provider_from_file(path: Path, name: str) -> bool:
 
 
 def load_config(cwd: Path | None = None) -> Config:
+    """叠加加载。某层配置文件损坏时跳过该层并记录警告，不阻断启动。"""
     cwd = (cwd or Path.cwd()).resolve()
     merged = DEFAULTS
+    warnings: list[str] = []
     for path in (
         Path.home() / CONFIG_DIR_NAME / CONFIG_FILE_NAME,
         cwd / CONFIG_DIR_NAME / CONFIG_FILE_NAME,
     ):
-        overlay = _read_toml(path)
+        try:
+            overlay = _read_toml(path)
+        except ConfigError as exc:
+            warnings.append(f"{exc}（该文件已被忽略）")
+            continue
         if overlay:
             merged = deep_merge(merged, overlay)
-    return Config(cwd=cwd, **merged)
+    config = Config(cwd=cwd, **merged)
+    config.load_warnings = warnings
+    return config

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, ClassVar
 
 from emiya_agent.tools.base import Tool, ToolContext, ToolResult, resolve_path
@@ -46,7 +47,9 @@ class EditFileTool(Tool):
             return ToolResult(content=f"Error: 文件不存在: {path}", is_error=True)
 
         try:
-            raw = path.read_text(encoding="utf-8", newline="")  # newline="" 保留原样
+            raw = await asyncio.to_thread(
+                path.read_text, encoding="utf-8", newline=""  # newline="" 保留原样
+            )
         except UnicodeDecodeError:
             return ToolResult(content=f"Error: {path} 不是 UTF-8 文本文件", is_error=True)
 
@@ -74,6 +77,6 @@ class EditFileTool(Tool):
         )
         if uses_crlf:
             updated = updated.replace("\n", "\r\n")
-        path.write_text(updated, encoding="utf-8", newline="")
+        await asyncio.to_thread(path.write_text, updated, encoding="utf-8", newline="")
         n = count if replace_all else 1
         return ToolResult(content=f"已替换 {n} 处: {path}")

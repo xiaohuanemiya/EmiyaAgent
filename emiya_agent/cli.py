@@ -35,6 +35,12 @@ def main() -> None:
     parser.add_argument(
         "--cwd", type=Path, default=None, help="工作目录（默认当前目录）"
     )
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        default=None,
+        help="一次性执行模式：执行该提示词后退出（直通执行，工具自动放行）",
+    )
     args = parser.parse_args()
 
     try:
@@ -47,7 +53,11 @@ def main() -> None:
     from emiya_agent.ui.repl import Repl
 
     try:
-        asyncio.run(Repl(config).run())
+        repl = Repl(config)
+        if args.prompt is not None:
+            asyncio.run(repl.one_shot(args.prompt))
+        else:
+            asyncio.run(repl.run())
     except KeyboardInterrupt:
         pass
 

@@ -10,13 +10,20 @@ class UsageTracker:
     def __init__(self, config: Config) -> None:
         self._config = config
         self._per_route: dict[str, Usage] = {}
+        self._last_per_route: dict[str, Usage] = {}
         self.last_route: str | None = None
         self.last_usage: Usage = Usage()
 
     def add(self, route: str, usage: Usage) -> None:
         self._per_route[route] = self._per_route.get(route, Usage()) + usage
+        self._last_per_route[route] = usage
         self.last_route = route
         self.last_usage = usage
+
+    def last_for(self, route: str) -> Usage:
+        """指定路由最近一次请求的 usage（压缩触发必须用执行器自己的，
+        不能用全局 last_usage —— 会被翻译/压缩等其他角色的调用覆盖）。"""
+        return self._last_per_route.get(route, Usage())
 
     def total(self) -> Usage:
         total = Usage()
