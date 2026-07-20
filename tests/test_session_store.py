@@ -233,6 +233,7 @@ async def test_compaction_snapshot_is_resume_baseline(
     repl.route = "fake/model"
     repl.compactor = CompactionManager(fake_complete, keep_recent_turns=1)
     repl.console = quiet_console
+    repl.hooks = None
 
     await repl.maybe_compact(force=True)
 
@@ -242,7 +243,7 @@ async def test_compaction_snapshot_is_resume_baseline(
 
 @pytest.mark.asyncio
 async def test_resume_repairs_and_persists_dangling_tool_use(
-    tmp_path, quiet_console
+    tmp_path, config, quiet_console
 ):
     manager = SessionManager(tmp_path)
     session_id, store = manager.new_store()
@@ -260,6 +261,8 @@ async def test_resume_repairs_and_persists_dangling_tool_use(
     repl.store = None
     repl.messages = []
     repl.console = quiet_console
+    repl.config = config
+    repl.hooks = None
 
     await commands._resume(repl, session_id)
 
@@ -374,6 +377,7 @@ async def test_execute_turn_repairs_result_persistence_failure(
     repl.usage = Usage()
     repl.controller = None
     repl.hooks = None
+    repl.session_id = None
     repl.system = "system"
     repl.automation = True
     repl.event_sink = None
@@ -772,7 +776,7 @@ def test_protocol_repair_handles_missing_middle_tool_result():
 
 @pytest.mark.asyncio
 async def test_resume_persists_middle_protocol_repair_as_snapshot(
-    tmp_path, quiet_console
+    tmp_path, config, quiet_console
 ):
     manager = SessionManager(tmp_path)
     target_id, target_store = manager.new_store()
@@ -798,6 +802,8 @@ async def test_resume_persists_middle_protocol_repair_as_snapshot(
     repl.store = current_store
     repl.messages = current_messages
     repl.console = quiet_console
+    repl.config = config
+    repl.hooks = None
 
     await commands._resume(repl, target_id)
 

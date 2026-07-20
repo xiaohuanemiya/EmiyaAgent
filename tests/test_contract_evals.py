@@ -13,13 +13,17 @@ async def test_default_contract_suite_exercises_safety_boundaries() -> None:
     report = await run_contracts()
 
     assert report["ok"] is True
-    assert report["summary"] == {"total": 5, "passed": 5, "failed": 0}
+    assert report["summary"] == {"total": 9, "passed": 9, "failed": 0}
     cases = {case["id"]: case for case in report["cases"]}
     assert set(cases) == {
         "normal_tool_execution",
         "max_tokens_blocks_side_effect",
         "budget_blocks_side_effect",
         "duplicate_tool_call_id_not_executed",
+        "parallel_read_only_probes_execute_without_approval",
+        "unknown_tool_reports_error_and_continues",
+        "cancel_mid_batch_pairs_remaining_calls",
+        "approval_grant_executes_side_effect",
         "approval_denial_blocks_side_effect",
     }
     assert cases["normal_tool_execution"]["observed"]["side_effects"] == [
@@ -29,9 +33,13 @@ async def test_default_contract_suite_exercises_safety_boundaries() -> None:
         "max_tokens_blocks_side_effect",
         "budget_blocks_side_effect",
         "duplicate_tool_call_id_not_executed",
+        "unknown_tool_reports_error_and_continues",
         "approval_denial_blocks_side_effect",
     ):
         assert cases[case_id]["observed"]["side_effects"] == []
+    assert cases["cancel_mid_batch_pairs_remaining_calls"]["observed"][
+        "side_effects"
+    ] == [{"value": "first", "cancel": True}]
 
 
 @pytest.mark.asyncio
@@ -62,7 +70,7 @@ def test_contract_failure_returns_nonzero(
     assert exit_code == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
-    assert payload["summary"] == {"total": 5, "passed": 4, "failed": 1}
+    assert payload["summary"] == {"total": 9, "passed": 8, "failed": 1}
     failure = payload["cases"][0]["failures"][0]
     assert failure["field"] == "side_effects"
     assert failure["expected"] == []

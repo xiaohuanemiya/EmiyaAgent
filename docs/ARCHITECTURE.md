@@ -33,6 +33,7 @@ flowchart LR
 - `emiya_agent/ui/repl.py` 组装 Provider、工具、MCP、Hook、LSP、会话、记忆、压缩器和后台任务服务，管理它们的启动与关闭顺序。
 - `emiya_agent/ui/commands.py` 实现 `/trust`、`/tasks`、`/checkpoint`、`/fork`、`/hooks`、`/lsp` 等 REPL 控制命令。
 - `emiya_agent/ui/json_output.py` 提供 `schema_version = "1"` 的单对象 JSON 与顺序编号 NDJSON 事件；机器输出不能混入 Rich 界面文本。
+- `emiya_agent/diagnostics.py` 生成 `/doctor` 与 `emiya doctor` 共用的脱敏诊断报告：只读、不联网、不启动子进程，凭据只报来源。
 
 ### 配置与信任
 
@@ -84,6 +85,8 @@ REPL 与一次性 CLI 都把普通输入原样交给主 `AgentLoop`。是否直�
 6. `PostToolUse` Hook 可把已完成结果标记为错误，但不能撤销已发生的副作用。
 
 Hook 命令以 argv 直接启动，不经过 shell；stdin 是有界 JSON 事件，stdout/stderr、超时与进程树均受限。多个匹配 Hook 可并发执行，但按配置顺序确定性聚合，优先级固定为 `deny > ask > allow`。
+
+除工具事件外，REPL 与子 agent 还发出生命周期事件：`UserPromptSubmit`（deny 阻止提示词进入历史）、`SessionStart`/`SessionEnd`、`Stop`、`SubagentStop`、`PreCompact`（deny 跳过本轮压缩）/`PostCompact`。只有决策型事件（`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`PreCompact`）的聚合决策改变控制流；观测型事件仅展示诊断，`matcher` 一律匹配事件主题（工具名、提示词、来源、停止原因或触发方式）。生命周期 Hook 的基础设施错误绝不打断主流程。
 
 审批是授权门，不是沙箱。`auto` 模式只是减少交互，不赋予后台任务超出当前用户权限的隔离。
 

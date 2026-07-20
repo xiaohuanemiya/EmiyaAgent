@@ -10,10 +10,28 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class HookEvent(StrEnum):
-    """Lifecycle points supported by the first hook protocol version."""
+    """Lifecycle points supported by the first hook protocol version.
+
+    ``matcher`` applies to a per-event subject string:
+
+    - ``PreToolUse`` / ``PostToolUse``: the tool name.
+    - ``UserPromptSubmit``: the raw prompt text.
+    - ``SessionStart``: the start source (``startup`` / ``resume`` / ``one-shot``).
+    - ``SessionEnd``: the end reason (``exit``).
+    - ``Stop``: the turn's stop reason (``end_turn`` / ``max_tokens`` / …).
+    - ``SubagentStop``: the subagent role name.
+    - ``PreCompact`` / ``PostCompact``: the trigger (``auto`` / ``manual``).
+    """
 
     PRE_TOOL_USE = "PreToolUse"
     POST_TOOL_USE = "PostToolUse"
+    USER_PROMPT_SUBMIT = "UserPromptSubmit"
+    SESSION_START = "SessionStart"
+    SESSION_END = "SessionEnd"
+    STOP = "Stop"
+    SUBAGENT_STOP = "SubagentStop"
+    PRE_COMPACT = "PreCompact"
+    POST_COMPACT = "PostCompact"
 
 
 class HookDecision(StrEnum):
@@ -22,6 +40,20 @@ class HookDecision(StrEnum):
     ALLOW = "allow"
     ASK = "ask"
     DENY = "deny"
+
+
+# Events whose aggregate decision gates the surrounding action. All other
+# events are observe-only: their decisions are recorded in diagnostics but
+# never change control flow, so a misbehaving hook cannot force the agent to
+# keep running or alter results retroactively.
+DECISION_EVENTS = frozenset(
+    {
+        HookEvent.PRE_TOOL_USE,
+        HookEvent.POST_TOOL_USE,
+        HookEvent.USER_PROMPT_SUBMIT,
+        HookEvent.PRE_COMPACT,
+    }
+)
 
 
 class HookCommandConfig(BaseModel):

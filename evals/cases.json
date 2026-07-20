@@ -129,6 +129,149 @@
       }
     },
     {
+      "id": "parallel_read_only_probes_execute_without_approval",
+      "description": "A batch of read-only tools runs in parallel and bypasses ask-mode approval.",
+      "approval": "ask",
+      "turns": [
+        {
+          "stop_reason": "tool_use",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "probe-1",
+              "name": "probe",
+              "input": {"probe": "one"}
+            },
+            {
+              "type": "tool_use",
+              "id": "probe-2",
+              "name": "probe",
+              "input": {"probe": "two"}
+            }
+          ]
+        },
+        {
+          "stop_reason": "end_turn",
+          "content": [{"type": "text", "text": "parallel done"}]
+        }
+      ],
+      "expect": {
+        "stop_reason": "end_turn",
+        "final_text": "parallel done",
+        "side_effects": [{"probe": "one"}, {"probe": "two"}],
+        "approval_requests": [],
+        "provider_requests": 2,
+        "history_roles": ["user", "assistant", "user", "assistant"],
+        "tool_results": [
+          {"tool_use_id": "probe-1", "is_error": false},
+          {"tool_use_id": "probe-2", "is_error": false}
+        ]
+      }
+    },
+    {
+      "id": "unknown_tool_reports_error_and_continues",
+      "description": "A call to an unregistered tool pairs an error result and the loop continues.",
+      "approval": "auto",
+      "turns": [
+        {
+          "stop_reason": "tool_use",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call-missing",
+              "name": "missing",
+              "input": {}
+            }
+          ]
+        },
+        {
+          "stop_reason": "end_turn",
+          "content": [{"type": "text", "text": "recovered from unknown tool"}]
+        }
+      ],
+      "expect": {
+        "stop_reason": "end_turn",
+        "final_text": "recovered from unknown tool",
+        "side_effects": [],
+        "approval_requests": [],
+        "provider_requests": 2,
+        "history_roles": ["user", "assistant", "user", "assistant"],
+        "tool_results": [
+          {"tool_use_id": "call-missing", "is_error": true}
+        ]
+      }
+    },
+    {
+      "id": "cancel_mid_batch_pairs_remaining_calls",
+      "description": "Cancellation between serial calls pairs the remaining calls as errors without dispatch.",
+      "approval": "auto",
+      "turns": [
+        {
+          "stop_reason": "tool_use",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call-cancelling",
+              "name": "record",
+              "input": {"value": "first", "cancel": true}
+            },
+            {
+              "type": "tool_use",
+              "id": "call-after-cancel",
+              "name": "record",
+              "input": {"value": "second"}
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "stop_reason": "interrupted",
+        "final_text": "",
+        "side_effects": [{"value": "first", "cancel": true}],
+        "approval_requests": [],
+        "provider_requests": 1,
+        "history_roles": ["user", "assistant", "user"],
+        "tool_results": [
+          {"tool_use_id": "call-cancelling", "is_error": false},
+          {"tool_use_id": "call-after-cancel", "is_error": true}
+        ]
+      }
+    },
+    {
+      "id": "approval_grant_executes_side_effect",
+      "description": "A granted write approval executes the tool exactly once.",
+      "approval": "ask",
+      "approval_decisions": [true],
+      "turns": [
+        {
+          "stop_reason": "tool_use",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call-approved",
+              "name": "record",
+              "input": {"value": "approved"}
+            }
+          ]
+        },
+        {
+          "stop_reason": "end_turn",
+          "content": [{"type": "text", "text": "approval honoured"}]
+        }
+      ],
+      "expect": {
+        "stop_reason": "end_turn",
+        "final_text": "approval honoured",
+        "side_effects": [{"value": "approved"}],
+        "approval_requests": ["record"],
+        "provider_requests": 2,
+        "history_roles": ["user", "assistant", "user", "assistant"],
+        "tool_results": [
+          {"tool_use_id": "call-approved", "is_error": false}
+        ]
+      }
+    },
+    {
       "id": "approval_denial_blocks_side_effect",
       "description": "A denied write approval produces an error result without executing the tool.",
       "approval": "ask",

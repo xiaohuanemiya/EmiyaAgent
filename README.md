@@ -19,7 +19,7 @@
 - **项目记忆**：`.emiyacode/memory/`（MEMORY.md 索引 + 一事一文件），跨会话持久
 - **上下文压缩**：超过执行模型窗口 70% 自动用 DeepSeek 摘要旧轮次；`/compact` 手动触发
 - **MCP 接入**：stdio / streamable-HTTP 服务器，工具以 `mcp__服务器__工具` 注册
-- **策略 Hook**：有界 `PreToolUse` / `PostToolUse` 命令钩子，可提升审批或阻断工具，子 agent 同样生效
+- **策略 Hook**：有界命令钩子覆盖工具与生命周期事件（`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`/`Stop`/`SubagentStop`/`PreCompact`/`PostCompact`），决策型事件可提升审批或阻断，子 agent 同样生效
 - **LSP 语义导航**：按需连接本地 language server，提供诊断、定义、引用、悬停和符号查询
 - **会话持久化**：容错 JSONL 转录、`/resume` 恢复、不可变命名检查点与带 lineage 的会话分叉
 - **自动化接口**：`--json` 单对象 / `--stream-json` NDJSON，稳定退出码与全局轮次、超时、USD 预算
@@ -98,7 +98,8 @@ $env:MINIMAX_API_KEY = "..."          # 设 key
 | `/route [角色] [route]` | 查看/设置任意角色的模型路由 |
 | `/provider [add\|remove]` | 管理供应商（预设一步接入 MiniMax/Kimi 等） |
 | `/mcp` | MCP 服务器状态与工具 |
-| `/hooks` | 审核当前用户级命令 Hook |
+| `/hooks` | 审核当前用户级命令 Hook（工具与生命周期事件） |
+| `/doctor` | 脱敏自检：配置、凭据来源、路由、Hook/MCP/LSP、会话（另有 `emiya doctor [--json]`） |
 | `/lsp` | Language Server 配置与活动连接 |
 | `/skills` | 列出可用技能 |
 | `/memory` | 查看项目记忆 |
@@ -162,7 +163,11 @@ pattern = 'git (status|diff)( --[a-z-]+)*'
 # Hook 仅从用户配置加载。命令是 argv，不经过 shell；JSON 事件从 stdin 输入。
 [[hooks]]
 id = "guard-production"
-event = "PreToolUse"            # PreToolUse | PostToolUse
+# 决策型: PreToolUse | PostToolUse | UserPromptSubmit | PreCompact
+# 观测型: SessionStart | SessionEnd | Stop | SubagentStop | PostCompact
+event = "PreToolUse"
+# matcher 匹配事件主题：工具事件为工具名；UserPromptSubmit 为提示词文本；
+# SessionStart 为 startup/resume/one-shot；Stop 为停止原因；*Compact 为 auto/manual
 matcher = "^(shell|write_file|edit_file)$"
 command = ["python", "C:/Users/me/.emiyacode/hooks/guard.py"]
 timeout = 5
@@ -226,6 +231,13 @@ Hook 的 `allow` 永远不能绕过 shell deny 规则或已有用户审批。std
 `hook_inherit_env` 都是用户级策略，可信项目也不能覆盖。裸 Hook 命令同样只从白名单环境
 中的绝对 PATH 目录解析。
 
+事件分两类：**决策型**（`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`PreCompact`）
+的聚合决策会实际拦截对应动作——`UserPromptSubmit` 的 `deny` 阻止提示词进入历史与模型，
+`PreCompact` 的 `deny` 跳过本轮压缩；**观测型**（`SessionStart`/`SessionEnd`/`Stop`/
+`SubagentStop`/`PostCompact`）只展示诊断，`deny` 不改变控制流，因此行为异常的 Hook
+无法强迫 agent 继续运行或事后篡改结果。stdin JSON 的 `tool_name` 字段承载事件主题
+（与 matcher 相同的字符串），`payload` 携带事件明细。
+
 LSP 默认关闭，`lsp_enabled` 和 `lsp_inherit_env` 只能在用户配置中设置；可信项目可以声明
 服务器参数，但不能自行启用。查询按文件扩展名和优先级选择首个已安装的候选，不会运行
 包管理器或自动下载。裸命令只搜索白名单环境中的绝对 `PATH` 目录，忽略 cwd、空项和
@@ -281,6 +293,14 @@ uv run emiya -p "检查项目" --json --max-turns 12 --timeout 300
 
 # 逐行输出 run_start / text_delta / tool_result / message_done / final 等 NDJSON
 uv run emiya -p "运行测试" --stream-json --approval auto --max-budget-usd 0.50
+```
+
+环境或配置有疑问时先跑脱敏自检（绝不输出凭据值，`--json` 供脚本消费；
+存在 fail 级检查项时退出码为 3）：
+
+```powershell
+uv run emiya doctor
+uv run emiya doctor --json
 ```
 
 `--max-turns`、`--timeout`、`--max-budget-usd` 都是整次调用的全局上限，执行器、

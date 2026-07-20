@@ -8,6 +8,10 @@
 
 ### Added
 
+- Hook 事件面从工具事件扩展到生命周期：新增 `UserPromptSubmit`、`SessionStart`、`SessionEnd`、`Stop`、`SubagentStop`、`PreCompact`、`PostCompact`。决策型事件（`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`PreCompact`）的聚合决策实际拦截动作；其余为观测型，`deny` 不改变控制流。`matcher` 语义泛化为按事件主题匹配（工具名/提示词/来源/停止原因/触发方式）。
+- 脱敏自检：REPL `/doctor` 与 CLI `emiya doctor [--json]`。报告覆盖版本、配置来源与警告、provider 凭据来源（绝不含 key 值）、角色路由可用性、Hook/MCP/LSP 概览与会话状态；URL 去除 userinfo/query，命令只保留可执行文件名；存在 fail 级检查项时退出码为 3。
+- 离线契约评测从 5 个扩展到 9 个：新增并行只读工具免审批、未知工具错误配对后继续、串行批次中途取消的剩余调用配对、审批放行恰好执行一次。
+
 - 用户级完整命令 `shell_rules`，支持有序的 `allow`、`ask`、`deny` 决策。
 - 有界 `PreToolUse` / `PostToolUse` 命令 Hook；Hook 只可维持或提高现有权限要求，并传递到子 agent。
 - 可选的本地 LSP 查询工具，支持诊断、定义、引用、悬停、文档符号和工作区符号；按需启动、复用连接并限制结果范围。

@@ -333,9 +333,16 @@ class HookRunner:
             return self
         return HookRunner(self._configs, cwd=resolved_cwd, env=env)
 
+    def has_hooks_for(self, event: HookEvent) -> bool:
+        """Return whether any configured hook listens to this event."""
+
+        return any(config.event == event for config in self._configs)
+
     def _matching(
         self, event: HookEvent, tool_name: str
     ) -> tuple[HookCommandConfig, ...]:
+        # ``tool_name`` is the event's matcher subject: the tool name for
+        # tool events, and the source/reason/trigger for lifecycle events.
         return tuple(
             config
             for config in self._configs
@@ -413,7 +420,11 @@ class HookRunner:
         """Run all matches and aggregate with ``deny > ask > allow``.
 
         An ``allow`` response can never lower ``initial_decision``. This keeps
-        hooks from bypassing the normal tool approval policy.
+        hooks from bypassing the normal tool approval policy. For lifecycle
+        events ``tool_name`` carries the event subject (start source, stop
+        reason, compaction trigger, …) both for matching and on stdin; whether
+        the aggregate decision gates anything is the caller's contract (see
+        ``DECISION_EVENTS`` in :mod:`emiya_agent.hooks.models`).
         """
 
         event = HookEvent(event)

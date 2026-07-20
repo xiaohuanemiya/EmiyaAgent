@@ -28,7 +28,8 @@ from emiya_agent.agent.usage import UsageTracker
 from emiya_agent.compaction.manager import CompactionManager
 from emiya_agent.config import Config, config_files_exist, select_environment
 from emiya_agent.errors import ConfigError, ProviderError
-from emiya_agent.hooks import HookRunner
+from emiya_agent.hooks import HookDecision, HookEvent, HookRunner
+from emiya_agent.hooks.models import HookRunResult
 from emiya_agent.lsp.manager import LSPManager
 from emiya_agent.mcp_client.adapter import build_mcp_tools
 from emiya_agent.mcp_client.manager import MCPManager
@@ -248,25 +249,72 @@ class Repl:
             return True
         return answer in ("", "y", "yes", "是")
 
+    # ------------------------------------------------------------- 生命周期 Hook
+
+    async def emit_hook_event(
+        self,
+        event: HookEvent,
+        subject: str,
+        payload: dict | None = None,
+    ) -> HookRunResult | None:
+        """运行一个生命周期事件的用户级 Hook。
+
+        基础设施错误绝不打断主流程；返回 None 表示无匹配 Hook 或运行失败。
+        决策是否生效由调用方按 DECISION_EVENTS 约定处理，观测型事件只展示诊断。
+        """
+        if self.hooks is None or not self.hooks.has_hooks_for(event):
+            return None
+        try:
+            result = await self.hooks.run(
+                event, subject, payload, initial_decision=HookDecision.ALLOW
+            )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            self.console.print(
+                f"[yellow]Hook 基础设施错误（{event.value}）: "
+                f"{escape(f'{type(exc).__name__}: {exc}')}[/yellow]"
+            )
+            return None
+        for diagnostic in result.diagnostics:
+            if diagnostic.status != "ok":
+                self.console.print(
+                    f"[yellow]Hook {escape(diagnostic.hook_id)}"
+                    f"（{diagnostic.status}）: {escape(diagnostic.reason)}[/yellow]"
+                )
+        return result
+
     # ------------------------------------------------------------- 主循环
 
     async def run(self) -> None:
         await self._maybe_first_run_init()
         self._banner()
         await self._connect_mcp()
+        await self.emit_hook_event(
+            HookEvent.SESSION_START,
+            "startup",
+            {"source": "startup", "cwd": str(self.config.cwd)},
+        )
         try:
             await self._main_loop()
         finally:
             try:
-                await self.task_service.shutdown()
+                await self.emit_hook_event(
+                    HookEvent.SESSION_END,
+                    "exit",
+                    {"reason": "exit", "session_id": self.session_id},
+                )
             finally:
                 try:
-                    await self.lsp.close_all()
+                    await self.task_service.shutdown()
                 finally:
                     try:
-                        await self.mcp.stop_all()  # 确保 stdio 子进程被终止
+                        await self.lsp.close_all()
                     finally:
-                        self._release_store_writer()
+                        try:
+                            await self.mcp.stop_all()  # 确保 stdio 子进程被终止
+                        finally:
+                            self._release_store_writer()
         self.console.print("[dim]再见。[/dim]")
 
     async def one_shot(self, text: str) -> bool:
@@ -276,18 +324,30 @@ class Repl:
         self.last_error_kind = None
         try:
             await self._connect_mcp()
+            await self.emit_hook_event(
+                HookEvent.SESSION_START,
+                "one-shot",
+                {"source": "one-shot", "cwd": str(self.config.cwd)},
+            )
             return await self._execute_turn(text) is not None
         finally:
             try:
-                await self.task_service.shutdown()
+                await self.emit_hook_event(
+                    HookEvent.SESSION_END,
+                    "exit",
+                    {"reason": "exit", "session_id": self.session_id},
+                )
             finally:
                 try:
-                    await self.lsp.close_all()
+                    await self.task_service.shutdown()
                 finally:
                     try:
-                        await self.mcp.stop_all()
+                        await self.lsp.close_all()
                     finally:
-                        self._release_store_writer()
+                        try:
+                            await self.mcp.stop_all()
+                        finally:
+                            self._release_store_writer()
 
     async def _maybe_first_run_init(self) -> None:
         """首次运行（无任何配置文件）且交互式终端时，询问是否初始化。"""
@@ -406,6 +466,20 @@ class Repl:
             if force:
                 self.console.print("[dim]对话还很短，无需压缩。[/dim]")
             return
+        trigger = "manual" if force else "auto"
+        # PreCompact 是决策型事件：deny 跳过本轮压缩（/compact 可再手动触发）。
+        pre_compact = await self.emit_hook_event(
+            HookEvent.PRE_COMPACT,
+            trigger,
+            {"trigger": trigger, "messages": len(self.messages)},
+        )
+        if pre_compact is not None and pre_compact.decision == HookDecision.DENY:
+            self.console.print(
+                "[yellow]PreCompact hook 阻止了本轮压缩，继续使用完整历史"
+                f"{'：' + escape(pre_compact.reason) if pre_compact.reason else '。'}"
+                "[/yellow]"
+            )
+            return
         try:
             before = len(self.messages)
             with self.console.status("[dim]正在压缩上下文…[/dim]"):
@@ -428,6 +502,15 @@ class Repl:
             self.console.print(
                 f"[dim]✂ 上下文已压缩：{before} → {len(self.messages)} 条消息"
                 "（原始记录保留在会话文件中）。[/dim]"
+            )
+            await self.emit_hook_event(
+                HookEvent.POST_COMPACT,
+                trigger,
+                {
+                    "trigger": trigger,
+                    "before": before,
+                    "after": len(self.messages),
+                },
             )
         except (
             ProviderError,
@@ -467,6 +550,21 @@ class Repl:
             self.last_error = str(exc)
             self.last_error_kind = "config"
             self.console.print(f"[red]{exc}[/red]")
+            return None
+
+        # UserPromptSubmit 是决策型事件：deny 阻止该提示词进入历史与模型。
+        prompt_hook = await self.emit_hook_event(
+            HookEvent.USER_PROMPT_SUBMIT,
+            text,
+            {"prompt": text, "session_id": self.session_id},
+        )
+        if prompt_hook is not None and prompt_hook.decision == HookDecision.DENY:
+            reason = prompt_hook.reason or "UserPromptSubmit hook 拒绝了该提示词"
+            self.last_error = f"UserPromptSubmit hook blocked the prompt: {reason}"
+            self.last_error_kind = "execution"
+            self.console.print(
+                f"[yellow]提示词已被 Hook 拦截，未发送: {escape(reason)}[/yellow]"
+            )
             return None
 
         msg = user_message(text)
@@ -533,6 +631,15 @@ class Repl:
             raise
 
         self.last_result = result
+        await self.emit_hook_event(
+            HookEvent.STOP,
+            result.stop_reason,
+            {
+                "stop_reason": result.stop_reason,
+                "route": self.route,
+                "session_id": self.session_id,
+            },
+        )
         text_result = self._report_result(result)
         if not self.automation:
             await self.maybe_compact()

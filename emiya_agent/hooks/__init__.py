@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, Any
 
 from emiya_agent.hooks.models import (
+    DECISION_EVENTS,
     HookCommandConfig,
     HookDecision,
     HookDiagnostic,
@@ -22,6 +23,7 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(name)
 
 __all__ = [
+    "DECISION_EVENTS",
     "HookCommandConfig",
     "HookDecision",
     "HookDiagnostic",

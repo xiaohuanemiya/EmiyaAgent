@@ -39,7 +39,9 @@ def _harden_stdio() -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="emiya", description="EmiyaAgent — 多智能体 AI 编程助手"
+        prog="emiya",
+        description="EmiyaAgent — 多智能体 AI 编程助手",
+        epilog="子命令: emiya doctor [--json]  运行脱敏自检",
     )
     parser.add_argument("--version", action="version", version=f"emiya {__version__}")
     parser.add_argument(
@@ -197,10 +199,60 @@ async def _one_shot(repl, prompt: str, controller: RunController) -> tuple[bool,
     return ok, timed_out
 
 
+def _run_doctor(argv: Sequence[str]) -> int:
+    """`emiya doctor [--json] [--cwd …]`：输出脱敏诊断报告。
+
+    退出码：0 = 无 fail 级检查项；3 = 存在 fail 级检查项或配置无法加载。
+    """
+    parser = argparse.ArgumentParser(
+        prog="emiya doctor",
+        description="脱敏自检：配置、凭据来源、路由、Hook/MCP/LSP、会话（绝不输出凭据值）",
+    )
+    parser.add_argument("--cwd", type=Path, default=None, help="工作目录")
+    parser.add_argument("--json", action="store_true", help="输出机器可读 JSON 报告")
+    args = parser.parse_args(argv)
+
+    from emiya_agent.diagnostics import build_report, render_report
+
+    try:
+        config = load_config(args.cwd)
+    except EmiyaError as exc:
+        if args.json:
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "fail",
+                        "error": str(exc),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        else:
+            print(f"配置错误: {exc}", file=sys.stderr)
+        return int(ExitCode.CONFIG_ERROR)
+    report = build_report(config)
+    if args.json:
+        sys.stdout.write(
+            json.dumps(report, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+    else:
+        print(render_report(report))
+    return int(
+        ExitCode.CONFIG_ERROR if report["status"] == "fail" else ExitCode.SUCCESS
+    )
+
+
 def run(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a stable process exit code."""
 
     _harden_stdio()
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "doctor":
+        return _run_doctor(list(argv[1:]))
     parser = _parser()
     args = parser.parse_args(argv)
     one_shot_only = any(

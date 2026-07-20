@@ -295,11 +295,29 @@ async def _config(repl: "Repl", args: str) -> bool:
     return False
 
 
-@command("hooks", "列出用户级 PreToolUse/PostToolUse 命令 Hook")
+@command("doctor", "运行脱敏自检：配置、凭据来源、路由、Hook/MCP/LSP、会话")
+async def _doctor(repl: "Repl", args: str) -> bool:
+    from emiya_agent.diagnostics import build_report, render_report
+
+    report = build_report(
+        repl.config,
+        mcp_status=repl.mcp.status() or None,
+        lsp_connections=repl.lsp.connected_count,
+    )
+    repl.console.print(render_report(report), markup=False, highlight=False)
+    repl.console.print(
+        "[dim]报告不含任何凭据值；`emiya doctor --json` 可导出机器可读版本。[/dim]"
+    )
+    return False
+
+
+@command("hooks", "列出用户级命令 Hook（工具与生命周期事件）")
 async def _hooks(repl: "Repl", args: str) -> bool:
     if not repl.config.hooks:
         repl.console.print(
-            "[dim]暂无 Hook；仅从用户级 ~/.emiyacode/config.toml 加载。[/dim]"
+            "[dim]暂无 Hook；仅从用户级 ~/.emiyacode/config.toml 加载。"
+            "事件: PreToolUse/PostToolUse/UserPromptSubmit/SessionStart/"
+            "SessionEnd/Stop/SubagentStop/PreCompact/PostCompact。[/dim]"
         )
         return False
     table = Table(box=None, padding=(0, 2))
@@ -314,7 +332,12 @@ async def _hooks(repl: "Repl", args: str) -> bool:
             escape(hook.on_error),
         )
     repl.console.print(table)
-    repl.console.print("[dim]Hook 只能收紧既有权限；allow 不会绕过 ask/deny。[/dim]")
+    repl.console.print(
+        "[dim]Hook 只能收紧既有权限；allow 不会绕过 ask/deny。"
+        "决策型事件: PreToolUse/PostToolUse/UserPromptSubmit/PreCompact；"
+        "其余事件仅观测。matcher 匹配事件主题"
+        "（工具名/提示词/来源/停止原因/触发方式）。[/dim]"
+    )
     return False
 
 
@@ -798,6 +821,13 @@ async def _resume(repl: "Repl", args: str) -> bool:
         previous_store.release_writer()
     repl.console.print(
         f"已恢复会话 [bold]{session_id}[/bold]（{len(candidate_messages)} 条消息）。"
+    )
+    from emiya_agent.hooks import HookEvent
+
+    await repl.emit_hook_event(
+        HookEvent.SESSION_START,
+        "resume",
+        {"source": "resume", "cwd": str(repl.config.cwd), "session_id": session_id},
     )
     if repaired:
         repl.console.print("[yellow]已修复上次中断留下的未配对工具调用。[/yellow]")

@@ -168,6 +168,10 @@ class _ScriptedProvider(Provider):
 
 
 class _RecordingTool(Tool):
+    """Serial write-like tool. ``{"cancel": true}`` sets ctx.cancel after
+    recording, which lets cases exercise mid-batch cancellation
+    deterministically."""
+
     name: ClassVar[str] = "record"
     description: ClassVar[str] = "Record a deterministic side effect."
     input_schema: ClassVar[dict[str, Any]] = {
@@ -181,7 +185,28 @@ class _RecordingTool(Tool):
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         self.side_effects.append(copy.deepcopy(args))
+        if args.get("cancel") is True:
+            ctx.cancel.set()
         return ToolResult(content="recorded")
+
+
+class _ProbeTool(Tool):
+    """Read-only, parallel-safe tool sharing the case's side-effect log."""
+
+    name: ClassVar[str] = "probe"
+    description: ClassVar[str] = "Record a deterministic read-only probe."
+    input_schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "additionalProperties": True,
+    }
+    read_only: ClassVar[bool] = True
+
+    def __init__(self, sink: list[dict[str, Any]]) -> None:
+        self._sink = sink
+
+    async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        self._sink.append(copy.deepcopy(args))
+        return ToolResult(content="probed")
 
 
 class _ScriptedUI:
@@ -225,6 +250,7 @@ async def _observe_case(case: dict[str, Any]) -> dict[str, Any]:
     tool = _RecordingTool()
     registry = ToolRegistry()
     registry.register(tool)
+    registry.register(_ProbeTool(tool.side_effects))
     ui = _ScriptedUI(case.get("approval_decisions", []))
 
     with tempfile.TemporaryDirectory(prefix="emiya-contract-") as temp_dir:

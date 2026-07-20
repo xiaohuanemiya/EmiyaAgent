@@ -16,7 +16,7 @@ from emiya_agent.agent.control import RunController
 from emiya_agent.agent.loop import AgentLoop
 from emiya_agent.agent.usage import UsageTracker
 from emiya_agent.config import Config, select_environment
-from emiya_agent.hooks import HookRunner
+from emiya_agent.hooks import HookDecision, HookEvent, HookRunner
 from emiya_agent.lsp.manager import LSPManager
 from emiya_agent.providers.base import MessageDone
 from emiya_agent.providers.registry import ProviderRegistry
@@ -195,6 +195,33 @@ class SubagentSpawner:
 
         if result.stop_reason == "interrupted" and sub_ctx.cancel.is_set():
             raise asyncio.CancelledError
+
+        # SubagentStop 是观测型事件：诊断可见，决策不改变子 agent 结果。
+        if effective_hooks.has_hooks_for(HookEvent.SUBAGENT_STOP):
+            try:
+                outcome = await effective_hooks.run(
+                    HookEvent.SUBAGENT_STOP,
+                    role.name,
+                    {
+                        "role": role.name,
+                        "route": route,
+                        "stop_reason": result.stop_reason,
+                    },
+                    initial_decision=HookDecision.ALLOW,
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception:
+                outcome = None
+            if outcome is not None and not quiet and console is not None:
+                for diagnostic in outcome.diagnostics:
+                    if diagnostic.status != "ok":
+                        console.print(
+                            f"Hook {diagnostic.hook_id}"
+                            f"（{diagnostic.status}）: {diagnostic.reason}",
+                            markup=False,
+                            style="yellow",
+                        )
 
         if result.stop_reason == "refusal":
             return f"Subagent refused: {result.refusal or ''}"
