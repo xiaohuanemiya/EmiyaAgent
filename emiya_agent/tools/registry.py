@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from emiya_agent.providers.base import ToolSpec
-from emiya_agent.tools.base import Tool, ToolContext, truncate_output
+from emiya_agent.tools.base import (
+    PermissionAction,
+    Tool,
+    ToolContext,
+    truncate_output,
+)
 from emiya_agent.types import ToolResultBlock, ToolUseBlock
 
 
@@ -21,7 +26,10 @@ class ToolRegistry:
         return sorted(self._tools)
 
     def subset(
-        self, *, read_only_only: bool = False, exclude: frozenset[str] | set[str] = frozenset()
+        self,
+        *,
+        read_only_only: bool = False,
+        exclude: frozenset[str] | set[str] = frozenset(),
     ) -> "ToolRegistry":
         sub = ToolRegistry()
         for name, tool in self._tools.items():
@@ -33,12 +41,7 @@ class ToolRegistry:
         return sub
 
     def specs(self) -> list[ToolSpec]:
-        return [
-            ToolSpec(
-                name=t.name, description=t.description, input_schema=t.input_schema
-            )
-            for _, t in sorted(self._tools.items())
-        ]
+        return [tool.to_spec() for _, tool in sorted(self._tools.items())]
 
     def is_read_only(self, name: str) -> bool:
         tool = self._tools.get(name)
@@ -48,13 +51,54 @@ class ToolRegistry:
         tool = self._tools.get(name)
         return tool is not None and tool.read_only and not tool.interactive
 
-    def needs_approval(self, name: str) -> bool:
+    def needs_approval(self, name: str, args: dict | None = None) -> bool:
         tool = self._tools.get(name)
         if tool is None:
             return False
-        if tool.requires_approval is not None:
-            return tool.requires_approval
-        return not tool.read_only
+        return tool.approval_required(args or {})
+
+    def permission_decision(
+        self, name: str, args: dict, ctx: ToolContext
+    ) -> PermissionAction:
+        """工具级规则优先；否则按全局审批模式与工具副作用属性决定。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            return "allow"
+        override = tool.permission_override(args, ctx)
+        if override is not None:
+            return override
+        if ctx.config.tool_approval == "ask" and tool.approval_required(args):
+            return "ask"
+        return "allow"
+
+    async def permission_decision_for(
+        self, name: str, args: dict, ctx: ToolContext
+    ) -> PermissionAction:
+        """支持需要异步解析真实执行目标的工具审批。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            return "allow"
+        override = tool.permission_override(args, ctx)
+        if override is not None:
+            return override
+        if ctx.config.tool_approval == "ask" and await tool.approval_required_for(
+            args, ctx
+        ):
+            return "ask"
+        return "allow"
+
+    async def approval_preview(
+        self, name: str, args: dict, ctx: ToolContext
+    ) -> str | None:
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        return await tool.approval_preview(args, ctx)
+
+    async def approval_cancelled(self, name: str, args: dict, ctx: ToolContext) -> None:
+        tool = self._tools.get(name)
+        if tool is not None:
+            await tool.approval_cancelled(args, ctx)
 
     async def dispatch(self, call: ToolUseBlock, ctx: ToolContext) -> ToolResultBlock:
         """执行一个工具调用；任何异常都转为 is_error 结果，绝不向上抛。"""

@@ -89,9 +89,13 @@ class GrepTool(Tool):
     async def _rg(
         self, rg: str, pattern: str, root: Path, file_glob: str | None
     ) -> ToolResult:
-        argv = [rg, "-n", "--no-heading", "-S", "-m", "50", pattern, str(root)]
+        # --no-config 避免工作站的 RIPGREP_CONFIG_PATH 改变安全语义；
+        # -e 明确把模型输入标记为 pattern，-- 明确结束选项，防止
+        # ``--pre=COMMAND`` 一类字符串被 rg 当成可执行选项。
+        argv = [rg, "--no-config", "-n", "--no-heading", "-S", "-m", "50"]
         if file_glob:
-            argv[1:1] = ["--glob", file_glob]
+            argv.extend(["--glob", file_glob])
+        argv.extend(["-e", pattern, "--", str(root)])
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,

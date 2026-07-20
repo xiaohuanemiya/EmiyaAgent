@@ -48,7 +48,11 @@ def build_catalog() -> list[WizardEntry]:
             lang="zh",
             example_models=["deepseek-v4-flash", "deepseek-v4-pro"],
             alt_urls=[
-                ("Anthropic 兼容端点", "https://api.deepseek.com/anthropic", "anthropic")
+                (
+                    "Anthropic 兼容端点",
+                    "https://api.deepseek.com/anthropic",
+                    "anthropic",
+                )
             ],
         ),
         WizardEntry(
@@ -105,7 +109,7 @@ ROLE_ORDER = [
 
 ROLE_NOTES = {
     "executor": "主执行 agent（工具循环，干活主力）",
-    "translator": "需求扩写/翻译（建议便宜模型）",
+    "translator": "下一跳语言适配（建议便宜模型）",
     "compactor": "上下文压缩摘要（建议便宜模型）",
     "subagent_explore": "只读搜索子 agent（建议便宜模型）",
     "subagent_plan": "方案设计子 agent（建议强模型）",
@@ -159,11 +163,11 @@ async def _wizard(repl) -> bool:
     console.print("[bold]== EmiyaAgent 初始化向导 ==[/bold]")
     console.print("选择要配置的供应商（可多选，未选中的将跳过）:")
     for i, entry in enumerate(catalog, 1):
-        lang = "中文/免译" if entry.lang == "zh" else "英文/翻译"
-        console.print(
-            f"  {i}. {entry.name:12s} {entry.note}（{lang}）", markup=False
-        )
-    raw = await repl.read_line("编号或名称，逗号分隔（如 1,3 / deepseek,glm / all；回车跳过）> ")
+        lang = f"主要语言 {entry.lang}"
+        console.print(f"  {i}. {entry.name:12s} {entry.note}（{lang}）", markup=False)
+    raw = await repl.read_line(
+        "编号或名称，逗号分隔（如 1,3 / deepseek,glm / all；回车跳过）> "
+    )
     selected = parse_selection(raw, catalog)
     if not selected:
         console.print("[dim]未选择任何供应商。[/dim]")
@@ -189,9 +193,7 @@ async def _wizard(repl) -> bool:
             for i, cand in enumerate(candidates, 1):
                 mark = " ←建议" if cand == suggested else ""
                 console.print(f"  {i}. {cand}{mark}", markup=False)
-            answer = (
-                await repl.read_line(f"选择编号（回车={suggested}）> ")
-            ).strip()
+            answer = (await repl.read_line(f"选择编号（回车={suggested}）> ")).strip()
             if answer.isdigit() and 1 <= int(answer) <= len(candidates):
                 routes[role] = candidates[int(answer) - 1]
             elif answer:
@@ -257,20 +259,22 @@ async def _configure_provider(
         else:
             base_url = answer
             proto_answer = (
-                await repl.read_line("协议（回车=openai 兼容；a=anthropic 兼容）> ")
-            ).strip().lower()
+                (await repl.read_line("协议（回车=openai 兼容；a=anthropic 兼容）> "))
+                .strip()
+                .lower()
+            )
             if proto_answer in ("a", "anthropic"):
                 protocol = "anthropic"
 
     # 2) API key
     key_answer = (
-        await repl.read_line(
-            f"API key（明文存入用户配置；回车跳过，改用环境变量 {entry.api_key_env}）> "
+        await repl.read_secret(
+            f"API key（隐藏输入且不记历史；回车跳过，改用环境变量 {entry.api_key_env}）> "
         )
     ).strip()
     api_key = key_answer or None
     if api_key:
-        console.print(f"[dim]已记录 key（{api_key[:6]}…，写入配置文件请注意保管）[/dim]")
+        console.print("[dim]已记录 key；将写入用户配置，请注意文件保管。[/dim]")
 
     # 3) 模型名
     examples = ", ".join(entry.example_models)
@@ -278,9 +282,7 @@ async def _configure_provider(
         await repl.read_line(f"模型名，逗号分隔（示例: {examples}；回车跳过）> ")
     ).strip()
     models = [
-        m.strip()
-        for m in models_answer.replace("，", ",").split(",")
-        if m.strip()
+        m.strip() for m in models_answer.replace("，", ",").split(",") if m.strip()
     ]
 
     pc = ProviderConfig(

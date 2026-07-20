@@ -11,30 +11,46 @@ class UsageTracker:
         self._config = config
         self._per_route: dict[str, Usage] = {}
         self._last_per_route: dict[str, Usage] = {}
+        self._per_scope_route: dict[str, dict[str, Usage]] = {}
+        self._last_per_scope_route: dict[str, dict[str, Usage]] = {}
         self.last_route: str | None = None
         self.last_usage: Usage = Usage()
 
-    def add(self, route: str, usage: Usage) -> None:
+    def add(self, route: str, usage: Usage, *, scope: str = "main") -> None:
         self._per_route[route] = self._per_route.get(route, Usage()) + usage
-        self._last_per_route[route] = usage
-        self.last_route = route
-        self.last_usage = usage
+        scoped = self._per_scope_route.setdefault(scope, {})
+        scoped[route] = scoped.get(route, Usage()) + usage
+        self._last_per_scope_route.setdefault(scope, {})[route] = usage
+        if scope == "main":
+            self._last_per_route[route] = usage
+            self.last_route = route
+            self.last_usage = usage
 
-    def last_for(self, route: str) -> Usage:
+    def last_for(self, route: str, *, scope: str = "main") -> Usage:
         """指定路由最近一次请求的 usage（压缩触发必须用执行器自己的，
         不能用全局 last_usage —— 会被翻译/压缩等其他角色的调用覆盖）。"""
-        return self._last_per_route.get(route, Usage())
+        return self._last_per_scope_route.get(scope, {}).get(route, Usage())
 
-    def total(self) -> Usage:
+    def total(self, *, scope: str | None = None) -> Usage:
         total = Usage()
-        for u in self._per_route.values():
+        source = (
+            self._per_route
+            if scope is None
+            else self._per_scope_route.get(scope, {})
+        )
+        for u in source.values():
             total = total + u
         return total
 
-    def cost(self) -> float:
+    def cost(self, *, scope: str | None = None) -> float:
         """按配置单价估算累计费用（USD）。"""
         cost = 0.0
-        for route, u in self._per_route.items():
+        source = (
+            self._per_route
+            if scope is None
+            else self._per_scope_route.get(scope, {})
+        )
+        for route, u in source.items():
             info = self._config.model_info(route)
             cost += u.input_tokens / 1e6 * info.input_price
             cost += u.output_tokens / 1e6 * info.output_price

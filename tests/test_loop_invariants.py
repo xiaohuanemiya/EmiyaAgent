@@ -6,15 +6,26 @@ from typing import Any, ClassVar
 
 import pytest
 
-from emiya_agent.agent.loop import INTERRUPTED_NOTE, AgentLoop
+from emiya_agent.agent.control import RunController, RunLimits
+from emiya_agent.agent.loop import (
+    INTERRUPTED_NOTE,
+    INVALID_STOP_NOTE,
+    POLICY_DENIED_NOTE,
+    AgentLoop,
+    _args_brief,
+)
+from emiya_agent.config import ModelInfo
+from emiya_agent.memory.manager import MemoryManager
 from emiya_agent.providers.base import MessageDone
 from emiya_agent.tools.base import Tool, ToolContext, ToolResult
+from emiya_agent.tools.memory_tool import MemoryTool
 from emiya_agent.tools.registry import ToolRegistry
 from emiya_agent.types import (
     Message,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
+    Usage,
     user_message,
 )
 from emiya_agent.ui.render import StreamRenderer
@@ -65,6 +76,47 @@ class WriteMarkTool(Tool):
         return ToolResult(content="marked")
 
 
+class RecordingTool(Tool):
+    """记录是否真正 dispatch，用于验证异常结束原因不会触发副作用。"""
+
+    name: ClassVar[str] = "record"
+    description: ClassVar[str] = "record dispatch"
+    input_schema: ClassVar[dict[str, Any]] = {"type": "object", "properties": {}}
+    read_only: ClassVar[bool] = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, args, ctx):
+        self.calls += 1
+        return ToolResult(content="dispatched")
+
+
+class PolicyDeniedTool(RecordingTool):
+    name: ClassVar[str] = "policy_denied"
+
+    def permission_override(self, args, ctx):
+        return "deny"
+
+
+class ApprovalPreviewBoomTool(RecordingTool):
+    name: ClassVar[str] = "approval_preview_boom"
+
+    async def approval_preview(self, args, ctx):
+        raise RuntimeError("preview exploded")
+
+
+class ApprovalCleanupTool(RecordingTool):
+    name: ClassVar[str] = "approval_cleanup"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled = 0
+
+    async def approval_cancelled(self, args, ctx):
+        self.cancelled += 1
+
+
 def make_registry(*tools: Tool) -> ToolRegistry:
     reg = ToolRegistry()
     for t in tools:
@@ -83,8 +135,8 @@ def make_ctx(tmp_path, config) -> ToolContext:
     return ToolContext(cwd=tmp_path, config=config, ui=FakeUI())
 
 
-def tool_use(id: str, name: str, **input: Any) -> ToolUseBlock:
-    return ToolUseBlock(id=id, name=name, input=input)
+def tool_use(id: str, tool_name: str, **input: Any) -> ToolUseBlock:
+    return ToolUseBlock(id=id, name=tool_name, input=input)
 
 
 # ------------------------------------------------------------------ 基本回合
@@ -236,6 +288,104 @@ async def test_max_iterations_guard(tmp_path, config, quiet_console):
     )
 
 
+@pytest.mark.parametrize("stop_reason", ["max_tokens", "end_turn", "error"])
+@pytest.mark.asyncio
+async def test_non_tool_stop_never_dispatches_embedded_tool_call(
+    stop_reason, tmp_path, config, quiet_console
+):
+    """截断或异常结束中的 tool_use 只补配对错误结果，绝不执行。"""
+    tool = RecordingTool()
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [tool_use("t1", "record", value="possibly truncated")],
+                stop_reason=stop_reason,
+            )
+        ]
+    )
+    loop = make_loop(provider, make_registry(tool), quiet_console)
+    messages = [user_message("go")]
+
+    result = await loop.run(messages, system="s", ctx=make_ctx(tmp_path, config))
+
+    assert result.stop_reason == stop_reason
+    assert tool.calls == 0
+    assert [m.role for m in messages] == ["user", "assistant", "user"]
+    (synthetic,) = [
+        b for b in messages[-1].content if isinstance(b, ToolResultBlock)
+    ]
+    assert synthetic.tool_use_id == "t1"
+    assert synthetic.is_error
+    assert INVALID_STOP_NOTE.format(stop_reason=stop_reason) == synthetic.content
+
+
+@pytest.mark.parametrize(
+    "calls",
+    [
+        [tool_use("t1", "record", _raw="{broken")],
+        [
+            tool_use("same", "record", value="first"),
+            tool_use("same", "record", value="second"),
+        ],
+        [tool_use("", "record")],
+        [tool_use("t1", "")],
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_tool_batch_never_dispatches(
+    calls, tmp_path, config, quiet_console
+):
+    tool = RecordingTool()
+    provider = FakeProvider([assistant_turn(calls, stop_reason="tool_use")])
+    persisted: list[Message] = []
+    loop = make_loop(
+        provider,
+        make_registry(tool),
+        quiet_console,
+        on_message=persisted.append,
+    )
+    messages = [user_message("go")]
+
+    result = await loop.run(messages, system="s", ctx=make_ctx(tmp_path, config))
+
+    assert result.stop_reason == "error"
+    assert tool.calls == 0
+    assert messages == [user_message("go")]
+    assert persisted == []
+
+
+@pytest.mark.parametrize("stop_reason", ["tool_use", "max_tokens", "end_turn"])
+@pytest.mark.asyncio
+async def test_duplicate_tool_ids_do_not_poison_next_request(
+    stop_reason, tmp_path, config, quiet_console
+):
+    calls = [tool_use("same", "record"), tool_use("same", "record")]
+    messages = [user_message("first")]
+    first_provider = FakeProvider([assistant_turn(calls, stop_reason=stop_reason)])
+    first_loop = make_loop(
+        first_provider, make_registry(RecordingTool()), quiet_console
+    )
+
+    result = await first_loop.run(
+        messages, system="s", ctx=make_ctx(tmp_path, config)
+    )
+    assert result.stop_reason == "error"
+    assert messages == [user_message("first")]
+
+    messages.append(user_message("retry"))
+    second_provider = FakeProvider(
+        [assistant_turn([TextBlock(text="recovered")], stop_reason="end_turn")]
+    )
+    second_loop = make_loop(second_provider, make_registry(), quiet_console)
+    second = await second_loop.run(
+        messages, system="s", ctx=make_ctx(tmp_path, config)
+    )
+
+    assert second.final_text == "recovered"
+    assert [m.role for m in second_provider.requests[0].messages] == ["user", "user"]
+    assert all(not message.tool_uses() for message in second_provider.requests[0].messages)
+
+
 @pytest.mark.asyncio
 async def test_refusal_not_appended(tmp_path, config, quiet_console):
     provider = FakeProvider(
@@ -266,18 +416,22 @@ async def test_approval_deny_blocks_tool(tmp_path, config, quiet_console):
     config.tool_approval = "ask"
     provider = FakeProvider(
         [
-            assistant_turn([tool_use("t1", "mark")], stop_reason="tool_use"),
+            assistant_turn(
+                [tool_use("t1", "approval_cleanup")], stop_reason="tool_use"
+            ),
             assistant_turn([TextBlock(text="adjusted")]),
         ]
     )
-    loop = make_loop(provider, make_registry(WriteMarkTool()), quiet_console)
+    tool = ApprovalCleanupTool()
+    loop = make_loop(provider, make_registry(tool), quiet_console)
     ui = FakeUI(approvals=[False])
     ctx = ToolContext(cwd=tmp_path, config=config, ui=ui)
     messages = [user_message("go")]
     result = await loop.run(messages, system="s", ctx=ctx)
 
     assert result.final_text == "adjusted"
-    assert ui.approval_requests == ["mark"]
+    assert ui.approval_requests == ["approval_cleanup"]
+    assert tool.cancelled == 1
     (tr,) = [b for b in messages[2].content if isinstance(b, ToolResultBlock)]
     assert tr.is_error
     from emiya_agent.agent.loop import DENIED_NOTE
@@ -304,6 +458,72 @@ async def test_approval_allow_executes(tmp_path, config, quiet_console):
 
 
 @pytest.mark.asyncio
+async def test_approval_preview_error_fails_closed_with_paired_result(
+    tmp_path, config, quiet_console
+):
+    config.tool_approval = "ask"
+    tool = ApprovalPreviewBoomTool()
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [tool_use("t1", "approval_preview_boom")], stop_reason="tool_use"
+            ),
+            assistant_turn([TextBlock(text="recovered")]),
+        ]
+    )
+    loop = make_loop(provider, make_registry(tool), quiet_console)
+    ui = FakeUI(approvals=[True])
+    messages = [user_message("go")]
+
+    result = await loop.run(
+        messages,
+        system="s",
+        ctx=ToolContext(cwd=tmp_path, config=config, ui=ui),
+    )
+
+    assert result.final_text == "recovered"
+    assert tool.calls == 0
+    assert ui.approval_requests == []
+    (tool_result,) = [
+        block for block in messages[2].content if isinstance(block, ToolResultBlock)
+    ]
+    assert tool_result.is_error is True
+    assert "Tool approval preview error" in tool_result.content
+
+
+@pytest.mark.asyncio
+async def test_approval_ui_error_fails_closed_with_paired_result(
+    tmp_path, config, quiet_console
+):
+    class BrokenApprovalUI(FakeUI):
+        async def confirm_tool(self, name, args_brief):
+            raise RuntimeError("approval channel failed")
+
+    config.tool_approval = "ask"
+    provider = FakeProvider(
+        [
+            assistant_turn([tool_use("t1", "mark")], stop_reason="tool_use"),
+            assistant_turn([TextBlock(text="recovered")]),
+        ]
+    )
+    loop = make_loop(provider, make_registry(WriteMarkTool()), quiet_console)
+    messages = [user_message("go")]
+
+    result = await loop.run(
+        messages,
+        system="s",
+        ctx=ToolContext(cwd=tmp_path, config=config, ui=BrokenApprovalUI()),
+    )
+
+    assert result.final_text == "recovered"
+    (tool_result,) = [
+        block for block in messages[2].content if isinstance(block, ToolResultBlock)
+    ]
+    assert tool_result.is_error is True
+    assert "Tool approval UI error" in tool_result.content
+
+
+@pytest.mark.asyncio
 async def test_auto_mode_skips_approval(tmp_path, config, quiet_console):
     config.tool_approval = "auto"
     provider = FakeProvider(
@@ -317,6 +537,70 @@ async def test_auto_mode_skips_approval(tmp_path, config, quiet_console):
     ctx = ToolContext(cwd=tmp_path, config=config, ui=ui)
     await loop.run([user_message("go")], system="s", ctx=ctx)
     assert ui.approval_requests == []  # 未询问
+
+
+@pytest.mark.asyncio
+async def test_permission_policy_denies_even_in_auto_mode(
+    tmp_path, config, quiet_console
+):
+    config.tool_approval = "auto"
+    tool = PolicyDeniedTool()
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [tool_use("t1", "policy_denied")], stop_reason="tool_use"
+            ),
+            assistant_turn([TextBlock(text="blocked")]),
+        ]
+    )
+    loop = make_loop(provider, make_registry(tool), quiet_console)
+    messages = [user_message("go")]
+
+    await loop.run(messages, system="s", ctx=make_ctx(tmp_path, config))
+
+    assert tool.calls == 0
+    (result,) = [
+        block
+        for block in messages[2].content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert result.is_error and POLICY_DENIED_NOTE in result.content
+
+
+@pytest.mark.asyncio
+async def test_default_approval_blocks_memory_write(
+    tmp_path, config, quiet_console
+):
+    memory_dir = tmp_path / ".emiyacode" / "memory"
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [
+                    tool_use(
+                        "t1",
+                        "memory",
+                        action="write",
+                        name="fact.md",
+                        content="persistent side effect",
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
+            assistant_turn([TextBlock(text="noted")]),
+        ]
+    )
+    loop = make_loop(
+        provider,
+        make_registry(MemoryTool(MemoryManager(memory_dir))),
+        quiet_console,
+    )
+    ui = FakeUI(approvals=[False])
+    ctx = ToolContext(cwd=tmp_path, config=config, ui=ui)
+
+    await loop.run([user_message("remember")], system="s", ctx=ctx)
+
+    assert ui.approval_requests == ["memory"]
+    assert not (memory_dir / "fact.md").exists()
 
 
 @pytest.mark.asyncio
@@ -347,6 +631,15 @@ def test_exempt_tools_do_not_require_approval():
     assert not reg.needs_approval("grep")
 
 
+def test_approval_preview_keeps_dangerous_command_tail():
+    command = "safe-prefix " + ("x" * 500) + " ; dangerous-tail"
+    preview = _args_brief(tool_use("t1", "shell", command=command), limit=100)
+
+    assert preview.startswith("command=safe-prefix")
+    assert "omitted" in preview
+    assert preview.endswith("dangerous-tail")
+
+
 # ------------------------------------------------------------------ 回调
 
 
@@ -375,3 +668,104 @@ async def test_callbacks_fire(tmp_path, config, quiet_console):
     assert [m.role for m in persisted] == ["assistant", "user", "assistant"]
     assert usages == ["fake/fake-model", "fake/fake-model"]
     assert tool_results == ["echo"]
+
+
+@pytest.mark.asyncio
+async def test_before_request_runs_for_each_internal_model_turn(
+    tmp_path, config, quiet_console
+):
+    provider = FakeProvider(
+        [
+            assistant_turn([tool_use("t1", "echo", text="a")], stop_reason="tool_use"),
+            assistant_turn([TextBlock(text="fin")]),
+        ]
+    )
+    observed_lengths: list[int] = []
+
+    async def before_request(messages: list[Message]) -> None:
+        observed_lengths.append(len(messages))
+
+    loop = make_loop(
+        provider,
+        make_registry(EchoTool()),
+        quiet_console,
+        before_request=before_request,
+    )
+
+    await loop.run(
+        [user_message("go")], system="s", ctx=make_ctx(tmp_path, config)
+    )
+
+    assert observed_lengths == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_global_turn_limit_stops_before_another_provider_request(
+    tmp_path, config, quiet_console
+):
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [tool_use("t1", "echo", text="a")], stop_reason="tool_use"
+            ),
+            assistant_turn([TextBlock(text="must not be requested")]),
+        ]
+    )
+    controller = RunController(config, RunLimits(max_turns=1))
+    loop = make_loop(
+        provider,
+        make_registry(EchoTool()),
+        quiet_console,
+        controller=controller,
+    )
+    messages = [user_message("go")]
+
+    result = await loop.run(
+        messages, system="s", ctx=make_ctx(tmp_path, config)
+    )
+
+    assert result.stop_reason == "max_turns"
+    assert len(provider.requests) == 1
+    assert controller.turns == 1
+    assert messages[-1].content[0].tool_use_id == "t1"
+
+
+@pytest.mark.asyncio
+async def test_budget_stop_pairs_but_never_dispatches_tool_calls(
+    tmp_path, config, quiet_console
+):
+    route = "fake/fake-model"
+    config.models[route] = ModelInfo(input_price=1.0, output_price=1.0)
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [tool_use("t1", "record")],
+                stop_reason="tool_use",
+                usage=Usage(output_tokens=1),
+            )
+        ]
+    )
+    tool = RecordingTool()
+    controller = RunController(
+        config, RunLimits(max_budget_usd="0.000001")
+    )
+    loop = make_loop(
+        provider,
+        make_registry(tool),
+        quiet_console,
+        controller=controller,
+    )
+    messages = [user_message("go")]
+
+    result = await loop.run(
+        messages, system="s", ctx=make_ctx(tmp_path, config)
+    )
+
+    assert result.stop_reason == "budget_exceeded"
+    assert tool.calls == 0
+    assert len(messages) == 3
+    synthetic = messages[-1].content[0]
+    assert isinstance(synthetic, ToolResultBlock)
+    assert synthetic.tool_use_id == "t1"
+    assert synthetic.is_error is True
+    assert "budget_exceeded" in synthetic.content

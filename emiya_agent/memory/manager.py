@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from emiya_agent.safe_paths import UnsafePathError, confined_path, open_confined
+
 INDEX_FILE = "MEMORY.md"
 MAX_FILE_CHARS = 50_000
 
@@ -23,34 +25,50 @@ class MemoryManager:
         """限制在 memory 目录内，拒绝路径穿越。"""
         if not name or not name.strip():
             raise ValueError("记忆文件名不能为空")
-        path = (self.dir / name).resolve()
-        if not path.is_relative_to(self.dir.resolve()):
-            raise ValueError(f"非法记忆路径: {name}")
-        return path
+        try:
+            return confined_path(self.dir, name, label="记忆文件")
+        except UnsafePathError as exc:
+            raise ValueError(f"非法记忆路径: {name}（{exc}）") from None
 
     def index_text(self) -> str:
-        path = self.dir / INDEX_FILE
-        if path.is_file():
-            try:
-                return path.read_text(encoding="utf-8").strip()
-            except (OSError, UnicodeDecodeError):
+        try:
+            path = self._resolve(INDEX_FILE)
+            if not path.is_file():
                 return ""
-        return ""
+            with open_confined(
+                self.dir,
+                INDEX_FILE,
+                "r",
+                label="记忆索引",
+                encoding="utf-8",
+            ) as file:
+                return file.read().strip()
+        except (OSError, UnicodeDecodeError, ValueError):
+            return ""
 
     def list_files(self) -> list[str]:
         if not self.dir.is_dir():
             return []
-        return sorted(
-            str(p.relative_to(self.dir))
-            for p in self.dir.rglob("*")
-            if p.is_file()
-        )
+        files: list[str] = []
+        for path in self.dir.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(self.dir)
+            try:
+                self._resolve(str(relative))
+            except ValueError:
+                continue
+            files.append(str(relative))
+        return sorted(files)
 
     def read(self, name: str) -> str:
         path = self._resolve(name)
         if not path.is_file():
             raise FileNotFoundError(f"记忆文件不存在: {name}")
-        return path.read_text(encoding="utf-8")
+        with open_confined(
+            self.dir, name, "r", label="记忆文件", encoding="utf-8"
+        ) as file:
+            return file.read()
 
     def write(self, name: str, content: str) -> None:
         if len(content) > MAX_FILE_CHARS:
@@ -58,7 +76,17 @@ class MemoryManager:
         self._ensure_dir()
         path = self._resolve(name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8", newline="\n")
+        # mkdir 后再校验，防止嵌套目录本身是仓库预置的链接。
+        self._resolve(name)
+        with open_confined(
+            self.dir,
+            name,
+            "w",
+            label="记忆文件",
+            encoding="utf-8",
+            newline="\n",
+        ) as file:
+            file.write(content)
 
     def delete(self, name: str) -> None:
         path = self._resolve(name)

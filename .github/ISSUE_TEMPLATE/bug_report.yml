@@ -1,0 +1,125 @@
+name: Bug 报告
+description: 报告可复现的错误、回归或跨平台问题
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你帮助改进 EmiyaAgent。请先搜索已有 issue，并只填写经过脱敏的信息。
+
+        **不要在公开 issue 中报告安全漏洞。** 审批绕过、越界访问、凭据泄露或未授权执行等问题请使用 [Private vulnerability reporting](https://github.com/xiaohuanemiya/EmiyaAgent/security/advisories/new)。
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我搜索过现有 issue，未发现相同问题。
+          required: true
+        - label: 这不是需要私下披露的安全漏洞。
+          required: true
+        - label: 我已删除 API key、token、私有代码、完整环境变量和敏感会话内容。
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: EmiyaAgent 版本
+      description: 请粘贴 `emiya --version` 的输出；源码运行请同时给出提交号。
+      placeholder: "emiya-agent 0.1.0 / commit abc1234"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Python 与安装方式
+      description: 例如 Python 3.12.8、`uv sync`、wheel 或源码 editable 安装。
+      placeholder: "Python 3.12.x，uv sync"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 运行模式
+      options:
+        - 交互式 REPL
+        - 一次性 human 输出
+        - "--json"
+        - "--stream-json"
+        - 后台子 agent
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题概述
+      description: 简洁说明发生了什么，以及影响了哪个工作流。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 最小复现步骤
+      description: 请给出从干净环境开始的有序步骤。尽量使用本地 fake，避免要求维护者访问私有 provider、MCP 或 LSP。
+      placeholder: |
+        1. 创建配置……
+        2. 运行 `uv run emiya ...`
+        3. 输入……
+        4. 观察到……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 包括退出码、停止原因或 JSON 事件类型（如适用）。
+    validations:
+      required: true
+
+  - type: textarea
+    id: configuration
+    attributes:
+      label: 相关配置（已脱敏）
+      description: 只保留复现所需的路由、协议、审批、Hook/LSP/MCP 或预算字段。删除 key、token、私有 URL、用户名和绝对敏感路径。
+      render: toml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或机器输出（已脱敏）
+      description: 请截取最小相关片段，不要上传完整 `.emiyacode`、会话 JSONL 或环境变量。
+      render: shell
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 其他信息
+      description: 可补充回归版本、稳定复现频率、最小仓库链接或已尝试的缓解方式。
+

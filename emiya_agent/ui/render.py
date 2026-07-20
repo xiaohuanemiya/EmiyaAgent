@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import AsyncIterator
 
 from rich.console import Console
+from rich.text import Text
 
 from emiya_agent.providers.base import (
     BlockStop,
@@ -17,6 +18,7 @@ from emiya_agent.providers.base import (
     TextDelta,
     ThinkingDelta,
 )
+from emiya_agent.ui.panels import safe_terminal_text
 
 
 class StreamRenderer:
@@ -36,18 +38,29 @@ class StreamRenderer:
                     in_thinking = True
                 elif ev.block_type == "tool_use":
                     self.console.print(
-                        f"[bold cyan]⚙ {ev.tool_name or 'tool'}[/bold cyan]"
+                        Text(
+                            f"⚙ {safe_terminal_text(ev.tool_name or 'tool')}",
+                            style="bold cyan",
+                        )
                     )
                 elif ev.block_type == "fallback":
                     self.console.print("[yellow]⤷ 已切换到备援模型[/yellow]")
             elif isinstance(ev, ThinkingDelta):
-                self.console.print(ev.thinking, end="", style="dim", highlight=False)
+                self.console.print(
+                    Text(safe_terminal_text(ev.thinking), style="dim"),
+                    end="",
+                    highlight=False,
+                )
                 printed_any = True
             elif isinstance(ev, TextDelta):
                 if in_thinking:
                     self.console.print()  # 思考与正文之间换行
                     in_thinking = False
-                self.console.print(ev.text, end="", highlight=False, markup=False)
+                self.console.print(
+                    Text(safe_terminal_text(ev.text)),
+                    end="",
+                    highlight=False,
+                )
                 printed_any = True
             elif isinstance(ev, BlockStop):
                 if in_thinking:
@@ -58,5 +71,17 @@ class StreamRenderer:
 
         if printed_any:
             self.console.print()  # 收尾换行
+        assert done is not None, "事件流未以 MessageDone 结束"
+        return done
+
+
+class QuietRenderer:
+    """后台任务使用：完整消费 provider 流，但不触碰共享终端。"""
+
+    async def render(self, events: AsyncIterator[StreamEvent]) -> MessageDone:
+        done: MessageDone | None = None
+        async for event in events:
+            if isinstance(event, MessageDone):
+                done = event
         assert done is not None, "事件流未以 MessageDone 结束"
         return done

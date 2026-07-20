@@ -36,6 +36,27 @@ from emiya_agent.types import (
     Usage,
 )
 
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _parse_tool_arguments(value: str) -> Any:
+    return json.loads(
+        value,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+
 _FINISH_MAP = {
     "stop": "end_turn",
     "tool_calls": "tool_use",
@@ -212,8 +233,8 @@ class ChunkAggregator:
             slot = self._tool_calls[idx]
             args_str = "".join(slot["args"]).strip()
             try:
-                args = json.loads(args_str) if args_str else {}
-            except json.JSONDecodeError:
+                args = _parse_tool_arguments(args_str) if args_str else {}
+            except ValueError:
                 args = {"_raw": args_str}
             blocks.append(
                 ToolUseBlock(

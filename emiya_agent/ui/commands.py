@@ -4,7 +4,21 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from rich.markup import escape
 from rich.table import Table
+
+from emiya_agent.config import (
+    persist_trusted_project,
+    project_config_path,
+    user_config_path,
+)
+from emiya_agent.safe_paths import UnsafePathError
+from emiya_agent.session.manager import repaired_message_copy
+from emiya_agent.session.store import (
+    CheckpointExistsError,
+    SessionBusyError,
+    SessionRecordTooLargeError,
+)
 
 if TYPE_CHECKING:
     from emiya_agent.ui.repl import Repl
@@ -62,6 +76,7 @@ async def _model(repl: "Repl", args: str) -> bool:
         repl.console.print(f"[red]切换失败: {exc}[/red]")
         return False
     repl.route = new_route
+    repl.config.routes["executor"] = new_route
     repl.console.print(f"已切换到 [bold]{new_route}[/bold]")
     return False
 
@@ -96,7 +111,7 @@ async def _provider(repl: "Repl", args: str) -> bool:
         table = Table(box=None, padding=(0, 2))
         table.add_column("供应商", style="cyan")
         table.add_column("端点")
-        table.add_column("语言基座")
+        table.add_column("模型语言")
         table.add_column("凭据")
         for name, pc in repl.config.providers.items():
             source = repl.config.credential_source(name)
@@ -105,7 +120,7 @@ async def _provider(repl: "Repl", args: str) -> bool:
                 if source
                 else f"[red]✗ 需设 {pc.api_key_env}[/red]"
             )
-            lang = "中文(免译)" if pc.lang == "zh" else "英文(启用翻译)"
+            lang = f"主要语言 {pc.lang}"
             table.add_row(name, pc.base_url or "(官方默认)", lang, cred)
         repl.console.print(table)
         not_added = [n for n in PRESETS if n not in repl.config.providers]
@@ -148,7 +163,8 @@ async def _provider(repl: "Repl", args: str) -> bool:
             repl.console.print(f"[dim]{preset.note}[/dim]")
         if pc.lang == "zh":
             repl.console.print(
-                "[dim]语言基座 zh：路由为执行模型时，中文需求免翻译直接 plan 确认。[/dim]"
+                "[dim]主要语言 zh：翻译 Agent 会在向该 provider 的模型交接时"
+                "把它作为目标语言。[/dim]"
             )
 
         repl.config.providers[name] = pc  # 本会话立即生效
@@ -161,7 +177,7 @@ async def _provider(repl: "Repl", args: str) -> bool:
         if repl.config.credential_source(name) is None:
             repl.console.print(
                 f'  1. 设置 key: $env:{pc.api_key_env}="..."'
-                f"（持久化: setx {pc.api_key_env} \"...\"）"
+                f'（持久化: setx {pc.api_key_env} "..."）'
             )
         repl.console.print(
             f"  2. 路由到它: /model {name}/{example_model} 或 "
@@ -180,9 +196,10 @@ async def _provider(repl: "Repl", args: str) -> bool:
             )
             return False
         removed = remove_provider_from_file(user_config_path(), name)
-        removed = remove_provider_from_file(
-            project_config_path(repl.config.cwd), name
-        ) or removed
+        removed = (
+            remove_provider_from_file(project_config_path(repl.config.cwd), name)
+            or removed
+        )
         repl.config.providers.pop(name, None)
         repl.providers.invalidate(name)
         if removed:
@@ -207,9 +224,7 @@ async def _route(repl: "Repl", args: str) -> bool:
         return False
     role = parts[0]
     if role not in routes:
-        repl.console.print(
-            f"[red]未知角色 {role!r}，可用: {', '.join(routes)}[/red]"
-        )
+        repl.console.print(f"[red]未知角色 {role!r}，可用: {', '.join(routes)}[/red]")
         return False
     if len(parts) == 1:
         current = repl.route if role == "executor" else routes[role]
@@ -231,7 +246,38 @@ async def _route(repl: "Repl", args: str) -> bool:
 @command("config", "显示当前生效配置与 API key 状态")
 async def _config(repl: "Repl", args: str) -> bool:
     cfg = repl.config
-    repl.console.print(f"语言模式: {cfg.language}  ·  max_tokens: {cfg.max_tokens}  ·  effort: {cfg.effort}")
+    repl.console.print(
+        "输入语言: 自动  ·  plan: Agent 自主"
+        f"  ·  max_tokens: {cfg.max_tokens}  ·  effort: {cfg.effort}"
+    )
+    project_state = (
+        "已信任"
+        if cfg.project_trusted
+        else "未信任（项目配置已忽略）"
+        if cfg.project_config_ignored
+        else "未配置"
+    )
+    path_scope = "允许外部目录" if cfg.allow_external_paths else "仅工作目录"
+    repl.console.print(
+        f"安全策略: approval={cfg.tool_approval}  ·  文件={path_scope}  ·  "
+        f"项目配置={project_state}"
+    )
+    repl.console.print(
+        f"命令策略: {len(cfg.shell_rules)} 条规则  ·  "
+        f"shell 环境白名单={len(cfg.shell_inherit_env)}  ·  "
+        f"MCP 环境白名单={len(cfg.mcp_inherit_env)}"
+        f" + {len(cfg.mcp_server_inherit_env)} 个服务器覆盖"
+    )
+    repl.console.print(
+        f"Hook: {len(cfg.hooks)} 个用户级命令  ·  "
+        f"环境白名单={len(cfg.hook_inherit_env)}"
+    )
+    lsp_state = "已启用" if cfg.lsp_enabled else "已禁用"
+    repl.console.print(
+        f"LSP: {lsp_state}  ·  {len(cfg.lsp_servers)} 个配置  ·  "
+        f"{repl.lsp.connected_count} 个连接  ·  "
+        f"环境白名单={len(cfg.lsp_inherit_env)}"
+    )
     repl.console.print("模型路由:")
     for role, route in cfg.routes.items():
         repl.console.print(f"  {role:18s} → {route}")
@@ -249,47 +295,127 @@ async def _config(repl: "Repl", args: str) -> bool:
     return False
 
 
+@command("hooks", "列出用户级 PreToolUse/PostToolUse 命令 Hook")
+async def _hooks(repl: "Repl", args: str) -> bool:
+    if not repl.config.hooks:
+        repl.console.print(
+            "[dim]暂无 Hook；仅从用户级 ~/.emiyacode/config.toml 加载。[/dim]"
+        )
+        return False
+    table = Table(box=None, padding=(0, 2))
+    for column in ("ID", "事件", "匹配", "命令", "失败策略"):
+        table.add_column(column)
+    for hook in repl.config.hooks:
+        table.add_row(
+            escape(hook.id),
+            escape(hook.event.value),
+            escape(hook.matcher),
+            escape(" ".join(hook.command)),
+            escape(hook.on_error),
+        )
+    repl.console.print(table)
+    repl.console.print("[dim]Hook 只能收紧既有权限；allow 不会绕过 ask/deny。[/dim]")
+    return False
+
+
+@command("lsp", "查看 Language Server 配置与活动连接")
+async def _lsp(repl: "Repl", args: str) -> bool:
+    state = "[green]已启用[/green]" if repl.config.lsp_enabled else "[dim]已禁用[/dim]"
+    repl.console.print(f"LSP: {state} · 活动连接: {repl.lsp.connected_count}")
+    if not repl.config.lsp_servers:
+        repl.console.print("[dim]未配置 language server。[/dim]")
+        return False
+    table = Table(box=None, padding=(0, 2))
+    for column in ("服务器", "命令", "扩展名", "优先级", "状态"):
+        table.add_column(column)
+    for name, server in sorted(
+        repl.config.lsp_servers.items(),
+        key=lambda item: (-item[1].priority, item[0]),
+    ):
+        table.add_row(
+            escape(name),
+            escape(" ".join((server.command, *server.args))),
+            escape(", ".join(sorted(server.extensions))),
+            str(server.priority),
+            "禁用" if server.disabled else "候选",
+        )
+    repl.console.print(table)
+    repl.console.print(
+        "[dim]服务器按文件类型、优先级与本地可执行文件选择；不会自动下载。"
+        "首次启动每个 server/root 时按审批策略展示实际命令。[/dim]"
+    )
+    return False
+
+
 @command("approval", "工具审批模式：/approval ask（写操作须确认）| auto（直接执行）")
 async def _approval(repl: "Repl", args: str) -> bool:
     arg = args.strip().lower()
     if not arg:
         mode = repl.config.tool_approval
-        desc = "写操作/shell/MCP 执行前询问" if mode == "ask" else "全部直接执行"
+        desc = (
+            "写操作/shell/MCP 执行前询问"
+            if mode == "ask"
+            else "默认直接执行（显式 ask/deny 规则仍优先）"
+        )
         repl.console.print(f"当前审批模式: [bold]{mode}[/bold]（{desc}）")
         return False
     if arg not in ("ask", "auto"):
         repl.console.print("[red]用法: /approval ask|auto[/red]")
         return False
     repl.config.tool_approval = arg
+    cancelled: list[str] = []
+    if arg == "ask":
+        for record in repl.task_service.list():
+            if record.spec.role == "general" and await repl.task_service.cancel(
+                record.id
+            ):
+                cancelled.append(record.id)
+        for task_id in cancelled:
+            await repl.task_service.wait(task_id)
     repl.console.print(
         "已切换到 [bold]ask[/bold]：shell/写文件/MCP 执行前会请求确认"
         if arg == "ask"
-        else "已切换到 [bold]auto[/bold]：所有工具直接执行（注意风险）"
+        else "已切换到 [bold]auto[/bold]：默认直接执行；显式 ask/deny 规则仍优先"
     )
+    if cancelled:
+        repl.console.print(
+            f"[yellow]已取消 {len(cancelled)} 个后台 general 任务；"
+            "其 worktree 保留供检查。[/yellow]"
+        )
     return False
 
 
-@command("lang", "查看/切换语言模式：/lang zh 启用中文管线，/lang en 直通")
-async def _lang(repl: "Repl", args: str) -> bool:
-    arg = args.strip().lower()
-    if not arg:
-        mode = "zh（中文管线）" if repl.config.language == "zh" else "en（直通）"
-        repl.console.print(f"当前语言模式: {mode}")
+@command("trust", "信任当前项目的 .emiyacode/config.toml（重启后生效）")
+async def _trust(repl: "Repl", args: str) -> bool:
+    path = project_config_path(repl.config.cwd)
+    if not path.is_file():
+        repl.console.print("[dim]当前项目没有 .emiyacode/config.toml。[/dim]")
         return False
-    if arg not in ("zh", "en"):
-        repl.console.print("[red]用法: /lang zh|en[/red]")
+    if repl.config.project_trusted:
+        repl.console.print("[dim]当前项目配置已经受信任。[/dim]")
         return False
-    repl.config.language = arg
+    persist_trusted_project(user_config_path(), repl.config.cwd)
     repl.console.print(
-        "已切换到 [bold]中文管线[/bold]（中文输入将先扩写为英文 spec 并确认）"
-        if arg == "zh"
-        else "已切换到 [bold]直通[/bold] 模式（输入原样交给执行模型）"
+        "[yellow]已将当前项目加入用户级信任列表。请检查项目配置后重启；"
+        "其中的 provider 端点与 MCP 命令将在下次启动生效。[/yellow]"
     )
     return False
 
 
 @command("clear", "清空当前对话上下文")
 async def _clear(repl: "Repl", args: str) -> bool:
+    if repl.store is not None:
+        # 保留同一 JSONL 中的旧记录用于审计，但恢复时从空上下文继续回放。
+        try:
+            repl.store.append_snapshot([])
+        except (
+            SessionRecordTooLargeError,
+            UnsafePathError,
+            OSError,
+            ValueError,
+        ) as exc:
+            repl.console.print(f"[red]清空失败，上下文未改变: {escape(str(exc))}[/red]")
+            return False
     repl.messages.clear()
     repl.console.print("[dim]对话上下文已清空。[/dim]")
     return False
@@ -304,7 +430,7 @@ async def _mcp(repl: "Repl", args: str) -> bool:
             "[mcp_servers.名称]\n"
             'command = "npx"  # stdio 方式\n'
             'args = ["-y", "@modelcontextprotocol/server-everything"]\n'
-            "# 或 HTTP 方式: url = \"https://example.com/mcp\"[/dim]"
+            '# 或 HTTP 方式: url = "https://example.com/mcp"[/dim]'
         )
         return False
     table = Table(box=None, padding=(0, 2))
@@ -371,6 +497,231 @@ async def _compact(repl: "Repl", args: str) -> bool:
     return False
 
 
+def _task_summary(record) -> tuple[str, str, str, str, str]:
+    prompt = record.spec.prompt.strip().splitlines()[0][:80]
+    return (
+        escape(record.id),
+        escape(record.status.value),
+        escape(record.spec.role),
+        escape(record.spec.isolation),
+        escape(prompt),
+    )
+
+
+@command("tasks", "列出后台子agent任务")
+async def _tasks(repl: "Repl", args: str) -> bool:
+    records = repl.task_service.list()
+    if not records:
+        repl.console.print("[dim]暂无后台子agent任务。[/dim]")
+        return False
+    table = Table(box=None, padding=(0, 2))
+    for column in ("任务 ID", "状态", "角色", "隔离", "任务"):
+        table.add_column(column)
+    for record in records:
+        table.add_row(*_task_summary(record))
+    repl.console.print(table)
+    repl.console.print(
+        "[dim]/task show|wait|cancel|cleanup <任务ID>；"
+        "清理含改动的 worktree 需显式 --force[/dim]"
+    )
+    return False
+
+
+@command(
+    "task",
+    "管理后台任务：/task show|wait|cancel|cleanup <任务ID> [超时秒数|--force]",
+)
+async def _task(repl: "Repl", args: str) -> bool:
+    parts = args.split()
+    if len(parts) < 2:
+        repl.console.print(
+            "[red]用法: /task show|wait|cancel|cleanup "
+            "<任务ID> [超时秒数|--force][/red]"
+        )
+        return False
+    action, task_id = parts[0].lower(), parts[1]
+    record = repl.task_service.get(task_id)
+    if record is None:
+        repl.console.print(f"[red]未知任务 {escape(task_id)}[/red]")
+        return False
+
+    if action in {"show", "get"}:
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        for label, value in zip(
+            ("任务 ID", "状态", "角色", "隔离", "任务"),
+            _task_summary(record),
+            strict=True,
+        ):
+            table.add_row(label, value)
+        if record.route:
+            table.add_row("模型", escape(record.route))
+        worktree = repl.task_service.worktree(task_id)
+        if worktree is not None:
+            table.add_row("worktree", escape(str(worktree.path)))
+            table.add_row("分支", escape(worktree.branch or "(detached)"))
+        repl.console.print(table)
+        if record.report:
+            repl.console.print(record.report, markup=False)
+        if record.error:
+            repl.console.print(f"[red]{escape(record.error)}[/red]")
+        return False
+
+    if action == "wait":
+        timeout: float | None = None
+        if len(parts) >= 3:
+            try:
+                timeout = float(parts[2])
+            except ValueError:
+                repl.console.print("[red]超时必须是秒数。[/red]")
+                return False
+            if not 0 <= timeout <= 600:
+                repl.console.print("[red]超时必须在 0 到 600 秒之间。[/red]")
+                return False
+        try:
+            record = await repl.task_service.wait(task_id, timeout=timeout)
+        except TimeoutError:
+            current = repl.task_service.get(task_id)
+            status = current.status.value if current else "unknown"
+            repl.console.print(f"[dim]任务仍在运行（{escape(status)}）。[/dim]")
+            return False
+        repl.console.print(
+            f"任务 {escape(task_id)}: [bold]{escape(record.status.value)}[/bold]"
+        )
+        output = record.report or record.error
+        if output:
+            repl.console.print(output, markup=False)
+        return False
+
+    if action == "cancel":
+        changed = await repl.task_service.cancel(task_id)
+        repl.console.print(
+            f"已请求取消任务 {escape(task_id)}。"
+            if changed
+            else f"[dim]任务 {escape(task_id)} 已结束。[/dim]"
+        )
+        return False
+
+    if action == "cleanup":
+        force = "--force" in parts[2:]
+        try:
+            await repl.task_service.cleanup(task_id, force=force)
+        except (KeyError, RuntimeError, ValueError) as exc:
+            repl.console.print(f"[red]清理失败: {escape(str(exc))}[/red]")
+            return False
+        repl.console.print(f"已清理任务 {escape(task_id)} 的 worktree。")
+        return False
+
+    repl.console.print(
+        f"[red]未知操作 {escape(action)!r}；可用 show/wait/cancel/cleanup[/red]"
+    )
+    return False
+
+
+@command("checkpoint", "保存命名检查点：/checkpoint <名称>")
+async def _checkpoint(repl: "Repl", args: str) -> bool:
+    name = args.strip()
+    if not name:
+        repl.console.print("[red]用法: /checkpoint <名称>[/red]")
+        return False
+    if repl.store is None or repl.session_id is None:
+        repl.console.print("[red]当前还没有可保存的会话。[/red]")
+        return False
+    try:
+        info = repl.store.append_checkpoint(name, repl.messages)
+    except (
+        CheckpointExistsError,
+        SessionRecordTooLargeError,
+        UnsafePathError,
+        OSError,
+        ValueError,
+    ) as exc:
+        repl.console.print(f"[red]保存检查点失败: {escape(str(exc))}[/red]")
+        return False
+    repl.console.print(
+        f"[green]已保存检查点 {escape(info.name)}[/green]"
+        f"（{info.message_count} 条消息）。"
+    )
+    return False
+
+
+@command("checkpoints", "列出当前会话的命名检查点")
+async def _checkpoints(repl: "Repl", args: str) -> bool:
+    if repl.store is None or repl.session_id is None:
+        repl.console.print("[dim]当前还没有会话。[/dim]")
+        return False
+    try:
+        infos = repl.store.list_checkpoints()
+    except (UnsafePathError, OSError) as exc:
+        repl.console.print(f"[red]读取检查点失败: {escape(str(exc))}[/red]")
+        return False
+    if not infos:
+        repl.console.print("[dim]当前会话暂无命名检查点。[/dim]")
+        return False
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("检查点", style="cyan")
+    table.add_column("消息数", justify="right")
+    table.add_column("创建时间")
+    table.add_column("首条消息")
+    for info in infos:
+        table.add_row(
+            escape(info.name),
+            str(info.message_count),
+            escape(info.created_at),
+            escape(info.preview or "(空)"),
+        )
+    repl.console.print(table)
+    repl.console.print("[dim]/fork <检查点> 从该位置创建独立会话[/dim]")
+    return False
+
+
+@command("fork", "分叉当前会话：/fork [检查点名称]")
+async def _fork(repl: "Repl", args: str) -> bool:
+    if repl.store is None or repl.session_id is None:
+        repl.console.print("[red]当前还没有可分叉的会话。[/red]")
+        return False
+    checkpoint_name = args.strip() or None
+    parent_id = repl.session_id
+    try:
+        if checkpoint_name is None:
+            forked = repl.session_mgr.fork(
+                parent_id, repl.messages, acquire_writer=True
+            )
+        else:
+            forked = repl.session_mgr.fork(
+                parent_id,
+                checkpoint_name=checkpoint_name,
+                acquire_writer=True,
+            )
+    except (
+        KeyError,
+        RuntimeError,
+        SessionRecordTooLargeError,
+        UnsafePathError,
+        OSError,
+        ValueError,
+    ) as exc:
+        repl.console.print(f"[red]分叉会话失败: {escape(str(exc))}[/red]")
+        return False
+
+    child_id, child_store, child_messages = forked
+    # 所有读取、校验和写入均成功后再一次性切换，失败路径保持父会话不变。
+    parent_store = repl.store
+    repl.session_id = child_id
+    repl.store = child_store
+    repl.messages = child_messages
+    parent_store.release_writer()
+    source = (
+        f"检查点 {escape(checkpoint_name)}"
+        if checkpoint_name is not None
+        else "当前上下文"
+    )
+    repl.console.print(
+        f"已从{source}分叉为会话 [bold]{escape(child_id)}[/bold]；"
+        f"父会话 {escape(parent_id)} 保持不变。"
+    )
+    return False
+
+
 @command("sessions", "列出历史会话")
 async def _sessions(repl: "Repl", args: str) -> bool:
     infos = repl.session_mgr.list_sessions()
@@ -379,31 +730,79 @@ async def _sessions(repl: "Repl", args: str) -> bool:
         return False
     table = Table(box=None, padding=(0, 2))
     table.add_column("会话 ID", style="cyan")
+    table.add_column("来源")
     table.add_column("首条消息")
     for info in infos:
         marker = " ←当前" if info.session_id == repl.session_id else ""
-        table.add_row(info.session_id + marker, info.preview or "(空)")
+        source = ""
+        if info.parent_session_id:
+            source = info.parent_session_id
+            if info.checkpoint_name:
+                source += f"@{info.checkpoint_name}"
+        table.add_row(
+            escape(info.session_id) + marker,
+            escape(source or "—"),
+            escape(info.preview or "(空)"),
+        )
     repl.console.print(table)
-    repl.console.print("[dim]/resume <ID> 恢复指定会话，/resume 恢复最近会话[/dim]")
+    repl.console.print(
+        "[dim]/resume <ID> 恢复指定会话；/checkpoint 与 /fork 管理分支[/dim]"
+    )
     return False
 
 
 @command("resume", "恢复会话：/resume [会话ID]（缺省最近一个）")
 async def _resume(repl: "Repl", args: str) -> bool:
     target = args.strip() or None
-    resumed = repl.session_mgr.resume(target)
+    if repl.session_id is not None and (target is None or target == repl.session_id):
+        repl.console.print(f"[dim]会话 {escape(repl.session_id)} 已是当前会话。[/dim]")
+        return False
+    try:
+        resumed = repl.session_mgr.resume(target, acquire_writer=True)
+    except (OSError, SessionBusyError, UnsafePathError, ValueError) as exc:
+        repl.console.print(
+            f"[red]恢复会话失败，当前会话未改变: {escape(str(exc))}[/red]"
+        )
+        return False
     if resumed is None:
         repl.console.print("[red]未找到可恢复的会话。[/red]")
         return False
     session_id, store, messages = resumed
+    candidate_messages, repaired = repaired_message_copy(
+        messages,
+        "Tool call not executed because the previous session ended before "
+        "recording its result",
+    )
+    if repaired:
+        try:
+            # 中间 tool_result 也可能因损坏行而缺失；完整快照可让所有
+            # 修复位置成为新的恢复基线，而非只在文件尾追加一条结果。
+            store.append_snapshot(candidate_messages)
+        except (
+            SessionRecordTooLargeError,
+            UnsafePathError,
+            OSError,
+            ValueError,
+        ) as exc:
+            store.release_writer()
+            repl.console.print(
+                f"[red]恢复会话失败，修复记录无法持久化: {escape(str(exc))}[/red]"
+            )
+            return False
+    # 候选上下文已完整读取且必要修复已落盘后，才切换当前会话。
+    previous_store = repl.store
     repl.session_id = session_id
     repl.store = store
-    repl.messages = messages
+    repl.messages = candidate_messages
+    if previous_store is not None:
+        previous_store.release_writer()
     repl.console.print(
-        f"已恢复会话 [bold]{session_id}[/bold]（{len(messages)} 条消息）。"
+        f"已恢复会话 [bold]{session_id}[/bold]（{len(candidate_messages)} 条消息）。"
     )
+    if repaired:
+        repl.console.print("[yellow]已修复上次中断留下的未配对工具调用。[/yellow]")
     # 展示最近的对话摘要帮助回忆
-    for msg in messages[-2:]:
+    for msg in candidate_messages[-2:]:
         text = msg.text().strip()
         if text:
             role = "你" if msg.role == "user" else "助手"

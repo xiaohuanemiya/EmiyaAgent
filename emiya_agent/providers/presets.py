@@ -18,7 +18,7 @@ class ProviderPreset:
     api_key_env: str
     note: str  # 展示给用户的一句话说明
     example_model: str  # 仅用于提示文案，不写入配置
-    lang: str = "en"  # 语言基座：zh 模型免翻译直接 plan
+    lang: str = "en"  # provider 模型的默认主要语言
 
 
 PRESETS: dict[str, ProviderPreset] = {

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from emiya_agent.config import load_config
+from emiya_agent.config import load_config, persist_trusted_project, user_config_path
 from emiya_agent.errors import ConfigError
 from emiya_agent.providers.openai_compat import OpenAICompatProvider
 from emiya_agent.providers.registry import ProviderRegistry
@@ -68,7 +68,8 @@ def test_glm_provider_in_defaults(tmp_path, monkeypatch):
 
 
 def test_model_lang_resolution(tmp_path, monkeypatch):
-    """语言基座：provider 默认 → model 覆盖 → 未知回退 en。"""
+    """模型主要语言：provider 默认 → model 覆盖 → 未知回退 en。"""
+    persist_trusted_project(user_config_path(), tmp_path)
     d = tmp_path / ".emiyacode"
     d.mkdir()
     (d / "config.toml").write_text(
@@ -120,6 +121,7 @@ def test_glm_uses_openai_compat_with_base_url(tmp_path, monkeypatch):
 
 def test_any_role_can_route_to_any_provider(tmp_path, monkeypatch):
     """配置层验证：所有角色路由均可指向任意一家。"""
+    persist_trusted_project(user_config_path(), tmp_path)
     d = tmp_path / ".emiyacode"
     d.mkdir()
     (d / "config.toml").write_text(

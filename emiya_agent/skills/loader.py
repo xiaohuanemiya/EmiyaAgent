@@ -69,7 +69,17 @@ def discover_skills(dirs: list[Path]) -> dict[str, Skill]:
     for d in dirs:
         if not d.is_dir():
             continue
+        try:
+            resolved_root = d.resolve(strict=True)
+        except OSError:
+            continue
         for skill_md in sorted(d.glob("*/SKILL.md")):
+            try:
+                # SKILL.md 会被自动索引、按需完整发送给模型；拒绝单文件
+                # symlink 逃出其声明的技能根目录。
+                skill_md.resolve(strict=True).relative_to(resolved_root)
+            except (OSError, ValueError):
+                continue
             skill = parse_skill_md(skill_md)
             if skill is not None:
                 skills[skill.name] = skill
@@ -77,10 +87,31 @@ def discover_skills(dirs: list[Path]) -> dict[str, Skill]:
 
 
 def default_skill_dirs(config: Config) -> list[Path]:
-    return [
-        Path.home() / CONFIG_DIR_NAME / "skills",  # 用户级
-        config.cwd / CONFIG_DIR_NAME / "skills",  # 项目级（优先）
-    ]
+    """兼容主流技能目录，并保持项目级与 .emiyacode 的覆盖优先级。
+
+    discover_skills 按顺序加载且后者覆盖前者，因此所有用户级目录先于项目级；
+    每个作用域内再让 EmiyaAgent 原生目录最后加载。
+    """
+    user_root = Path.home()
+    project_root = config.cwd
+    relative_dirs = (
+        Path(".agents") / "skills",
+        Path(".claude") / "skills",
+        Path(".codex") / "skills",
+        Path(CONFIG_DIR_NAME) / "skills",
+    )
+    user_dirs = [user_root / relative for relative in relative_dirs]
+    project_dirs: list[Path] = []
+    resolved_project = project_root.resolve()
+    for relative in relative_dirs:
+        candidate = project_root / relative
+        try:
+            # 项目级技能根本身也不能通过父目录链接逃出工作区。
+            candidate.resolve().relative_to(resolved_project)
+        except (OSError, ValueError):
+            continue
+        project_dirs.append(candidate)
+    return [*user_dirs, *project_dirs]
 
 
 def skills_index_text(skills: dict[str, Skill]) -> str:

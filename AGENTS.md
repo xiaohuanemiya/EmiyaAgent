@@ -9,7 +9,8 @@ Python 3.12+，uv 管理（`uv sync` / `uv run pytest` / `uv run emiya`）。
 - 工具循环不变量：每个 tool_use 必有配对 tool_result（中断时补 is_error 合成结果）；并行结果合入同一条 user 消息。
 - fable-5 不传 thinking 参数；所有现役 Claude 模型不传 temperature/top_p/top_k；
   第三方 anthropic 协议端点（非 claude 模型）不传 effort/thinking。
-- Windows 保持 Proactor 事件循环；子进程 finally 中 terminate+kill。
+- Windows 保持 Proactor 事件循环；shell 子进程放入 Job Object，POSIX 使用独立进程组，
+  超时/中断必须终止整棵进程树。
 - 运行时数据目录一律 `.emiyacode`（用户级 `~/.emiyacode/`，项目级 `./.emiyacode/`）。
 - 工具内的磁盘/遍历 IO 走 asyncio.to_thread，不阻塞事件循环。
 - 压缩触发用 usage.last_for(执行器路由)，不用全局 last_usage（会被翻译调用覆盖）。

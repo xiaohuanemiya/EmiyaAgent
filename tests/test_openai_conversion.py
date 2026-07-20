@@ -216,3 +216,13 @@ def test_aggregate_malformed_tool_args_do_not_crash():
     agg.feed(_chunk(finish_reason="tool_calls"))
     (tu,) = agg.finalize().message.tool_uses()
     assert tu.input == {"_raw": "{not json"}
+
+
+def test_aggregate_rejects_ambiguous_or_nonstandard_tool_json():
+    for arguments in ('{"path":"safe","path":"unsafe"}', '{"value":NaN}'):
+        agg = ChunkAggregator()
+        agg.feed(_chunk(_tool_delta(0, id="c0", name="a", arguments=arguments)))
+        agg.feed(_chunk(finish_reason="tool_calls"))
+
+        (tool_use,) = agg.finalize().message.tool_uses()
+        assert tool_use.input == {"_raw": arguments}

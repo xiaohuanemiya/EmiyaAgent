@@ -26,11 +26,18 @@ class FakeRepl:
         self.route = config.route("executor")
         self.answers = list(answers)
         self.prompts: list[str] = []
+        self.secret_prompts: list[str] = []
 
     async def read_line(self, prompt: str = "") -> str:
         self.prompts.append(prompt)
         if not self.answers:
             return ""  # 回车兜底
+        return self.answers.pop(0)
+
+    async def read_secret(self, prompt: str = "") -> str:
+        self.secret_prompts.append(prompt)
+        if not self.answers:
+            return ""
         return self.answers.pop(0)
 
     def output(self) -> str:
@@ -111,6 +118,8 @@ async def test_wizard_full_flow_deepseek(tmp_path, isolated_home, monkeypatch):
     assert saved.credential_source("deepseek") == "config.toml"
     # 会话内立即生效
     assert repl.route == "deepseek/deepseek-v4-flash"
+    assert len(repl.secret_prompts) == 1
+    assert "sk-ds-test" not in repl.output()
 
 
 @pytest.mark.asyncio

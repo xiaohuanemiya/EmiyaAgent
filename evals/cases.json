@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "normal_tool_execution",
+      "description": "A valid tool_use executes once and its result is returned to the model.",
+      "approval": "auto",
+      "turns": [
+        {
+          "stop_reason": "tool_use",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call-normal",
+              "name": "record",
+              "input": {"value": "safe"}
+            }
+          ]
+        },
+        {
+          "stop_reason": "end_turn",
+          "content": [{"type": "text", "text": "completed"}]
+        }
+      ],
+      "expect": {
+        "stop_reason": "end_turn",
+        "final_text": "completed",
+        "side_effects": [{"value": "safe"}],
+        "approval_requests": [],
+        "provider_requests": 2,
+        "history_roles": ["user", "assistant", "user", "assistant"],
+        "tool_results": [
+          {"tool_use_id": "call-normal", "is_error": false}
+        ]
+      }
+    },
+    {
+      "id": "max_tokens_blocks_side_effect",
+      "description": "A tool call embedded in a max_tokens response is paired but never dispatched.",
+      "approval": "auto",
+      "turns": [
+        {
+          "stop_reason": "max_tokens",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call-truncated",
+              "name": "record",
+              "input": {"value": "must-not-run"}
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "stop_reason": "max_tokens",
+        "final_text": "",
+        "side_effects": [],
+        "approval_requests": [],
+        "provider_requests": 1,
+        "history_roles": ["user", "assistant", "user"],
+        "tool_results": [
+          {"tool_use_id": "call-truncated", "is_error": true}
+        ]
+      }
+    },
+    {
+      "id": "budget_blocks_side_effect",
+      "description": "Usage that exhausts the run budget blocks a pending side effect before dispatch.",
+      "approval": "auto",
+      "limits": {"max_budget_usd": "0.000001"},
+      "pricing": {"input_price": 1.0, "output_price": 1.0},
+      "turns": [
+        {
+          "stop_reason": "tool_use",
+          "usage": {"input_tokens": 10, "output_tokens": 5},
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call-over-budget",
+              "name": "record",
+              "input": {"value": "must-not-run"}
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "stop_reason": "budget_exceeded",
+        "final_text": "",
+        "side_effects": [],
+        "approval_requests": [],
+        "provider_requests": 1,
+        "history_roles": ["user", "assistant", "user"],
+        "tool_results": [
+          {"tool_use_id": "call-over-budget", "is_error": true}
+        ]
+      }
+    },
+    {
+      "id": "duplicate_tool_call_id_not_executed",
+      "description": "Duplicate tool_use IDs reject the whole assistant turn without dispatch.",
+      "approval": "auto",
+      "turns": [
+        {
+          "stop_reason": "tool_use",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "duplicate",
+              "name": "record",
+              "input": {"value": "first"}
+            },
+            {
+              "type": "tool_use",
+              "id": "duplicate",
+              "name": "record",
+              "input": {"value": "second"}
+            }
+          ]
+        }
+      ],
+      "expect": {
+        "stop_reason": "error",
+        "final_text": "",
+        "side_effects": [],
+        "approval_requests": [],
+        "provider_requests": 1,
+        "history_roles": ["user"],
+        "tool_results": []
+      }
+    },
+    {
+      "id": "approval_denial_blocks_side_effect",
+      "description": "A denied write approval produces an error result without executing the tool.",
+      "approval": "ask",
+      "approval_decisions": [false],
+      "turns": [
+        {
+          "stop_reason": "tool_use",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call-denied",
+              "name": "record",
+              "input": {"value": "must-not-run"}
+            }
+          ]
+        },
+        {
+          "stop_reason": "end_turn",
+          "content": [{"type": "text", "text": "denial handled"}]
+        }
+      ],
+      "expect": {
+        "stop_reason": "end_turn",
+        "final_text": "denial handled",
+        "side_effects": [],
+        "approval_requests": ["record"],
+        "provider_requests": 2,
+        "history_roles": ["user", "assistant", "user", "assistant"],
+        "tool_results": [
+          {"tool_use_id": "call-denied", "is_error": true}
+        ]
+      }
+    }
+  ]
+}

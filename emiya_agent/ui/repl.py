@@ -10,31 +10,33 @@ import asyncio
 import sys
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
+from prompt_toolkit.history import DummyHistory, FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
-from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
+from rich.text import Text
 
 from emiya_agent import __version__
+from emiya_agent.agent.control import RunController
+from emiya_agent.agent.completion import complete_text
 from emiya_agent.agent.loop import AgentLoop, LoopResult
 from emiya_agent.agent.prompts import build_system_prompt, load_agent_md
 from emiya_agent.agent.subagent import SubagentSpawner
+from emiya_agent.agent.subagent_tasks import SubagentTaskService
 from emiya_agent.agent.usage import UsageTracker
 from emiya_agent.compaction.manager import CompactionManager
-from emiya_agent.config import CONFIG_DIR_NAME, Config, config_files_exist
+from emiya_agent.config import Config, config_files_exist, select_environment
 from emiya_agent.errors import ConfigError, ProviderError
+from emiya_agent.hooks import HookRunner
+from emiya_agent.lsp.manager import LSPManager
 from emiya_agent.mcp_client.adapter import build_mcp_tools
 from emiya_agent.mcp_client.manager import MCPManager
 from emiya_agent.memory.manager import MemoryManager
-from emiya_agent.pipeline.translation import (
-    TranslationPipeline,
-    complete_text,
-    contains_cjk,
-)
 from emiya_agent.providers.registry import ProviderRegistry
+from emiya_agent.safe_paths import UnsafePathError
 from emiya_agent.session.manager import SessionManager
-from emiya_agent.session.store import SessionStore
+from emiya_agent.session.store import SessionRecordTooLargeError, SessionStore
 from emiya_agent.skills.loader import (
     default_skill_dirs,
     discover_skills,
@@ -44,7 +46,8 @@ from emiya_agent.tools import build_default_registry
 from emiya_agent.tools.base import ToolContext
 from emiya_agent.tools.memory_tool import MemoryTool
 from emiya_agent.tools.skill_tool import SkillTool
-from emiya_agent.tools.task import SpawnSubagentTool
+from emiya_agent.tools.task import SpawnSubagentTool, SubagentTaskTool
+from emiya_agent.tools.translate import TranslateForModelTool
 from emiya_agent.types import (
     Message,
     ToolResultBlock,
@@ -52,41 +55,105 @@ from emiya_agent.types import (
     user_message,
 )
 from emiya_agent.ui import commands, panels
-from emiya_agent.ui.confirm import ConfirmUI
-from emiya_agent.ui.render import StreamRenderer
+from emiya_agent.ui.json_output import JsonEventSink, JsonStreamRenderer
+from emiya_agent.ui.render import QuietRenderer, StreamRenderer
 
 
 class Repl:
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        automation: bool = False,
+        output_mode: str = "human",
+        event_sink: JsonEventSink | None = None,
+        controller: RunController | None = None,
+    ) -> None:
+        if output_mode not in {"human", "json", "stream-json"}:
+            raise ValueError(f"unknown output mode: {output_mode}")
+        if output_mode == "stream-json" and event_sink is None:
+            raise ValueError("stream-json output requires an event sink")
         self.config = config
-        self.console = Console()
+        self.automation = automation
+        self.output_mode = output_mode
+        self.event_sink = event_sink
+        self.controller = controller
+        self.console = Console(file=sys.stderr) if output_mode != "human" else Console()
         self.providers = ProviderRegistry(config)
         self.usage = UsageTracker(config)
-        self.renderer = StreamRenderer(self.console)
+        if output_mode == "stream-json":
+            assert event_sink is not None
+            self.renderer = JsonStreamRenderer(event_sink)
+        elif output_mode == "json":
+            self.renderer = QuietRenderer()
+        else:
+            self.renderer = StreamRenderer(self.console)
         self.route = config.route("executor")
         self.messages: list[Message] = []
+        self.last_result: LoopResult | None = None
+        self.last_error: str | None = None
+        self.last_error_kind: str | None = None
 
         # skills / memory / 子agent / 压缩
         self.skills = discover_skills(default_skill_dirs(config))
-        self.memory = MemoryManager(config.cwd / CONFIG_DIR_NAME / "memory")
+        project_dir = config.project_dir()
+        self.memory = MemoryManager(config.project_runtime_dir("memory"))
+        project_instructions = load_agent_md(config.cwd)
+        skill_index = skills_index_text(self.skills)
+        memory_index = self.memory.index_text()
+        self.system = build_system_prompt(
+            config.cwd,
+            project_instructions,
+            skills_index=skill_index,
+            memory_index=memory_index,
+        )
+        shared_sections = [f"# Environment\n- Working directory: {config.cwd}"]
+        if project_instructions:
+            shared_sections.append(f"# Project instructions\n{project_instructions}")
+        if skill_index:
+            shared_sections.append(f"# Skills\n{skill_index}")
+
         self.tools = build_default_registry()
         self.tools.register(SkillTool(self.skills))
         self.tools.register(MemoryTool(self.memory))
-        self.spawner = SubagentSpawner(
-            self.providers, config, self.tools, self.renderer, self.usage
+        self.tools.register(
+            TranslateForModelTool(
+                self.providers,
+                config,
+                on_usage=self.usage.add,
+                controller=controller,
+            )
         )
-        self.tools.register(SpawnSubagentTool(self.spawner))
+        self.hooks = HookRunner(
+            config.hooks,
+            cwd=config.cwd,
+            env=select_environment(config.hook_inherit_env),
+        )
+        self.spawner = SubagentSpawner(
+            self.providers,
+            config,
+            self.tools,
+            self.renderer,
+            self.usage,
+            shared_context="\n\n".join(shared_sections),
+            controller=controller,
+            hooks=self.hooks,
+        )
+        self.task_service = SubagentTaskService(self.spawner, config)
+        self.tools.register(SpawnSubagentTool(self.spawner, self.task_service))
+        self.tools.register(SubagentTaskTool(self.task_service))
         self.compactor = CompactionManager(self._compactor_complete)
         self.mcp = MCPManager(config)
+        self.lsp = LSPManager(config, config.cwd)
 
-        self.system = build_system_prompt(
-            config.cwd,
-            load_agent_md(config.cwd),
-            skills_index=skills_index_text(self.skills),
-            memory_index=self.memory.index_text(),
+        self.tool_ctx = ToolContext(
+            cwd=config.cwd,
+            config=config,
+            ui=self,
+            state={"lsp_manager": self.lsp},
         )
-        self.tool_ctx = ToolContext(cwd=config.cwd, config=config, ui=self)
-        self.session_mgr = SessionManager(config.project_dir())
+        config.project_runtime_dir("sessions")
+        self.session_mgr = SessionManager(project_dir)
         self.store: SessionStore | None = None  # 首轮输入时惰性创建
         self.session_id: str | None = None
         self.first_run = not config_files_exist(config.cwd)
@@ -112,32 +179,28 @@ class Repl:
             raise EOFError
         return line.rstrip("\n").lstrip("\ufeff")
 
-    async def read_multiline(self, prompt: str, default: str = "") -> str:
-        """多行编辑。TTY 下 prompt_toolkit（Esc 后 Enter 提交）；管道模式读到 EOF 行为止。"""
-        if self.session is not None:
-            with patch_stdout():
-                return await self.session.prompt_async(
-                    prompt + "\n",
-                    default=default,
-                    multiline=True,
-                    bottom_toolbar="Esc 后按 Enter 提交 · Ctrl+C 取消",
-                )
-        self.console.print(
-            prompt + "（输入 EOF 单独一行结束；直接 EOF 保留原文）", markup=False
-        )
-        lines: list[str] = []
-        while True:
-            line = await asyncio.to_thread(sys.stdin.readline)
-            if line == "" or line.strip() == "EOF":
-                break
-            lines.append(line.rstrip("\n"))
-        return "\n".join(lines) if lines else default
+    async def read_secret(self, prompt: str) -> str:
+        """读取不回显、也绝不写入持久历史的敏感值。"""
+        if self.session is None:
+            # 管道/CI 没有可靠的隐藏输入能力；要求改用环境变量。
+            raise EOFError("secret input requires an interactive terminal")
+        secret_session: PromptSession[str] = PromptSession(history=DummyHistory())
+        with patch_stdout():
+            return await secret_session.prompt_async(prompt, is_password=True)
 
     # ------------------------------------------------------------- UIBridge
 
     async def ask(self, question: str, options: list[str] | None = None) -> str:
         """ask_user 工具的实现：展示问题并等待输入。"""
-        self.console.print(Panel(question, title="Agent 提问", border_style="magenta"))
+        if self.automation:
+            raise RuntimeError("ask_user is unavailable in one-shot mode")
+        self.console.print(
+            Panel(
+                Text(panels.safe_terminal_text(question)),
+                title="Agent 提问",
+                border_style="magenta",
+            )
+        )
         if options:
             for i, opt in enumerate(options, 1):
                 self.console.print(f"  {i}. {opt}", markup=False)
@@ -153,17 +216,28 @@ class Repl:
 
     async def confirm_tool(self, name: str, args_brief: str) -> bool:
         """写操作审批（tool_approval = "ask" 时）。a = 本会话改为全部放行。"""
+        if self.automation:
+            if self.event_sink is not None:
+                self.event_sink.emit(
+                    "approval_required",
+                    tool=name,
+                    preview=args_brief,
+                    approved=False,
+                )
+            return False
         self.console.print(
             Panel(
-                f"[bold]{name}[/bold]\n{args_brief}",
+                f"[bold]{escape(name)}[/bold]\n{escape(args_brief)}",
                 title="执行确认",
                 border_style="yellow",
             )
         )
         try:
             answer = (
-                await self.read_line("[y]允许(回车)  [n]拒绝  [a]本会话全部允许 > ")
-            ).strip().lower()
+                (await self.read_line("[y]允许(回车)  [n]拒绝  [a]本会话全部允许 > "))
+                .strip()
+                .lower()
+            )
         except (KeyboardInterrupt, EOFError):
             return False
         if answer in ("a", "always", "全部"):
@@ -183,17 +257,37 @@ class Repl:
         try:
             await self._main_loop()
         finally:
-            await self.mcp.stop_all()  # 确保 stdio 子进程被终止
+            try:
+                await self.task_service.shutdown()
+            finally:
+                try:
+                    await self.lsp.close_all()
+                finally:
+                    try:
+                        await self.mcp.stop_all()  # 确保 stdio 子进程被终止
+                    finally:
+                        self._release_store_writer()
         self.console.print("[dim]再见。[/dim]")
 
-    async def one_shot(self, text: str) -> None:
-        """emiya -p "...": 执行一轮后退出（直通执行，非交互 → 自动放行工具）。"""
-        self.config.tool_approval = "auto"
+    async def one_shot(self, text: str) -> bool:
+        """emiya -p "...": 执行一轮后退出；默认沿用安全审批策略。"""
+        self.last_result = None
+        self.last_error = None
+        self.last_error_kind = None
         try:
             await self._connect_mcp()
-            await self._execute_turn(text)
+            return await self._execute_turn(text) is not None
         finally:
-            await self.mcp.stop_all()
+            try:
+                await self.task_service.shutdown()
+            finally:
+                try:
+                    await self.lsp.close_all()
+                finally:
+                    try:
+                        await self.mcp.stop_all()
+                    finally:
+                        self._release_store_writer()
 
     async def _maybe_first_run_init(self) -> None:
         """首次运行（无任何配置文件）且交互式终端时，询问是否初始化。"""
@@ -203,10 +297,14 @@ class Repl:
 
         try:
             answer = (
-                await self.read_line(
-                    "检测到首次运行。现在初始化模型供应商吗？[Y/n] > "
+                (
+                    await self.read_line(
+                        "检测到首次运行。现在初始化模型供应商吗？[Y/n] > "
+                    )
                 )
-            ).strip().lower()
+                .strip()
+                .lower()
+            )
         except (KeyboardInterrupt, EOFError):
             return
         if answer in ("", "y", "yes", "是"):
@@ -256,10 +354,9 @@ class Repl:
             await self.handle_input(line)
 
     def _banner(self) -> None:
-        mode = "中文管线" if self.pipeline_enabled else "直通"
         self.console.print(
             f"[bold magenta]EmiyaAgent[/bold magenta] v{__version__}  ·  "
-            f"执行模型 [bold]{self.route}[/bold]  ·  {mode}  ·  /help 查看命令"
+            f"执行模型 [bold]{self.route}[/bold]  ·  Agent 自主规划  ·  /help 查看命令"
         )
         for warning in self.config.load_warnings:
             self.console.print(f"[yellow]⚠ {warning}[/yellow]")
@@ -276,15 +373,9 @@ class Repl:
 
     # ------------------------------------------------------------- 输入分发
 
-    @property
-    def pipeline_enabled(self) -> bool:
-        return self.config.language == "zh"
-
     async def handle_input(self, text: str) -> None:
-        if self.pipeline_enabled and contains_cjk(text):
-            await self.pipeline_turn(text)
-        else:
-            await self._execute_turn(text)
+        """普通输入原样交给主 Agent；是否规划或派生子 Agent 由模型决定。"""
+        await self._execute_turn(text)
 
     # ------------------------------------------------------------- 压缩
 
@@ -292,7 +383,13 @@ class Repl:
         route = self.config.route("compactor")
         provider, model = self.providers.get(route)
         result, usage = await complete_text(
-            provider, model, system, text, max_tokens=self.config.max_tokens
+            provider,
+            model,
+            system,
+            text,
+            max_tokens=self.config.max_tokens,
+            route=route,
+            controller=self.controller,
         )
         self.usage.add(route, usage)
         return result
@@ -312,94 +409,53 @@ class Repl:
         try:
             before = len(self.messages)
             with self.console.status("[dim]正在压缩上下文…[/dim]"):
-                self.messages = await self.compactor.compact(self.messages)
-            self._ensure_store().append_meta(
-                "compaction", {"before": before, "after": len(self.messages)}
-            )
+                compacted = await self.compactor.compact(self.messages)
+            store = self._ensure_store()
+            # 原始消息继续保留在 JSONL 供审计；恢复时从此活跃上下文快照回放。
+            store.append_snapshot(compacted)
+            # 快照完整落盘后再改变内存，避免磁盘失败造成两边上下文分叉。
+            # 保持列表对象身份，确保正在运行的 AgentLoop 立即看到轮内结果。
+            self.messages[:] = compacted
+            try:
+                store.append_meta(
+                    "compaction", {"before": before, "after": len(self.messages)}
+                )
+            except (OSError, UnsafePathError, ValueError):
+                # 审计元数据不是恢复基线；快照已成功时不回滚压缩。
+                self.console.print(
+                    "[yellow]压缩已完成，但审计元数据写入失败。[/yellow]"
+                )
             self.console.print(
                 f"[dim]✂ 上下文已压缩：{before} → {len(self.messages)} 条消息"
                 "（原始记录保留在会话文件中）。[/dim]"
             )
-        except (ProviderError, ConfigError) as exc:
-            self.console.print(f"[yellow]压缩失败（{exc}），继续使用完整历史。[/yellow]")
+        except (
+            ProviderError,
+            ConfigError,
+            SessionRecordTooLargeError,
+            UnsafePathError,
+            OSError,
+            ValueError,
+        ) as exc:
+            self.console.print(
+                f"[yellow]压缩失败（{exc}），继续使用完整历史。[/yellow]"
+            )
 
     # ------------------------------------------------------------- 会话
 
     def _ensure_store(self) -> SessionStore:
         if self.store is None:
-            self.session_id, self.store = self.session_mgr.new_store()
+            self.session_id, self.store = self.session_mgr.new_store(
+                acquire_writer=True
+            )
         return self.store
+
+    def _release_store_writer(self) -> None:
+        if self.store is not None:
+            self.store.release_writer()
 
     def _persist(self, message: Message) -> None:
         self._ensure_store().append_message(message)
-
-    # ------------------------------------------------------------- 翻译管线
-
-    async def pipeline_turn(self, text: str) -> None:
-        translator_route = self.config.route("translator")
-        try:
-            t_provider, t_model = self.providers.get(translator_route)
-        except ConfigError as exc:
-            self.console.print(
-                f"[yellow]翻译模型不可用（{exc}），本轮直通执行。[/yellow]"
-            )
-            await self._execute_turn(text)
-            return
-
-        async def translator(system: str, user_text: str) -> str:
-            with self.console.status("[dim]DeepSeek 处理中…[/dim]"):
-                result, usage = await complete_text(
-                    t_provider,
-                    t_model,
-                    system,
-                    user_text,
-                    max_tokens=self.config.max_tokens,
-                )
-            self.usage.add(translator_route, usage)
-            return result
-
-        async def executor(spec_en: str) -> str:
-            return await self._execute_turn(spec_en) or ""
-
-        confirm = ConfirmUI(self.console, self.read_line, self.read_multiline)
-        pipeline = TranslationPipeline(
-            translator,
-            confirm,
-            executor,
-            executor_lang=self.config.model_lang(self.route),  # zh 基座免翻译
-        )
-        try:
-            result = await pipeline.run(text)
-        except ProviderError as exc:
-            self.console.print(f"[red]{exc}[/red]")
-            return
-        except (KeyboardInterrupt, EOFError):
-            self.console.print("\n[yellow]已取消。[/yellow]")
-            return
-
-        if result.aborted:
-            self.console.print("[dim]已放弃该需求。[/dim]")
-            return
-        if result.spec is not None:
-            self._ensure_store().append_meta(
-                "spec",
-                {
-                    "requirement_zh": text,
-                    "spec": result.spec.spec,
-                    "mode": "translate" if result.spec.mirror is not None else "native",
-                },
-            )
-        if result.report_zh.strip():
-            self._ensure_store().append_meta(
-                "report", {"en": result.report_en, "zh": result.report_zh}
-            )
-            self.console.print(
-                Panel(
-                    Markdown(result.report_zh),
-                    title="执行报告（中文）",
-                    border_style="green",
-                )
-            )
 
     # ------------------------------------------------------------- 执行一轮
 
@@ -408,6 +464,8 @@ class Repl:
         try:
             provider, model = self.providers.get(self.route)
         except ConfigError as exc:
+            self.last_error = str(exc)
+            self.last_error_kind = "config"
             self.console.print(f"[red]{exc}[/red]")
             return None
 
@@ -417,6 +475,15 @@ class Repl:
         self.tool_ctx.cancel = asyncio.Event()  # 每轮重置
 
         def on_tool_result(call: ToolUseBlock, result: ToolResultBlock) -> None:
+            if self.event_sink is not None:
+                self.event_sink.emit(
+                    "tool_result",
+                    tool_use_id=call.id,
+                    tool_name=call.name,
+                    input=call.input,
+                    content=result.content,
+                    is_error=result.is_error,
+                )
             panels.print_tool_call(self.console, call)
             panels.print_tool_result(self.console, call, result)
 
@@ -431,27 +498,53 @@ class Repl:
             on_message=self._persist,
             on_usage=self.usage.add,
             on_tool_result=on_tool_result,
+            before_request=lambda _messages: self.maybe_compact(),
+            controller=self.controller,
+            hooks=self.hooks,
         )
         try:
-            result = await loop.run(self.messages, system=self.system, ctx=self.tool_ctx)
+            result = await loop.run(
+                self.messages, system=self.system, ctx=self.tool_ctx
+            )
         except ProviderError as exc:
             self._repair_dangling()
+            self.last_error = str(exc)
+            self.last_error_kind = "provider"
             self.console.print(f"[red]{exc}[/red]")
             return None
         except (KeyboardInterrupt, EOFError):
             self.tool_ctx.cancel.set()
             self._repair_dangling()
+            self.last_result = LoopResult(final_text="", stop_reason="interrupted")
             self.console.print("\n[yellow]已中断本轮。[/yellow]")
             return None
+        except Exception as exc:
+            # AgentLoop commits protocol messages to memory before invoking
+            # the persistence callback. If that callback (or a later
+            # integration) fails, repair the JSONL suffix without hiding the
+            # original failure.
+            try:
+                self._repair_dangling("Tool loop aborted after an internal error")
+            except Exception as repair_exc:
+                exc.add_note(
+                    "Additionally failed to repair the session's dangling "
+                    f"tool result: {type(repair_exc).__name__}: {repair_exc}"
+                )
+            raise
 
+        self.last_result = result
         text_result = self._report_result(result)
-        await self.maybe_compact()
+        if not self.automation:
+            await self.maybe_compact()
         return text_result
 
     def _report_result(self, result: LoopResult) -> str | None:
         if result.stop_reason == "refusal":
+            self.console.print(f"[red]模型拒绝了该请求: {result.refusal or ''}[/red]")
+            return None
+        if result.stop_reason == "error":
             self.console.print(
-                f"[red]模型拒绝了该请求: {result.refusal or ''}[/red]"
+                "[red]模型返回了非法或无法安全回放的工具调用，本轮已终止。[/red]"
             )
             return None
         if result.stop_reason == "interrupted":
@@ -467,27 +560,71 @@ class Repl:
             footer += " · [yellow]输出触顶被截断[/yellow]"
         if result.stop_reason == "max_iterations":
             footer += " · [yellow]达到迭代上限[/yellow]"
+        if result.stop_reason == "max_turns":
+            footer += " · [yellow]达到全局请求轮次上限[/yellow]"
+        if result.stop_reason == "budget_exceeded":
+            footer += " · [yellow]达到费用预算上限[/yellow]"
+        if result.stop_reason == "budget_unavailable":
+            footer += " · [yellow]缺少模型定价，无法执行预算约束[/yellow]"
+        if result.stop_reason == "timeout":
+            footer += " · [yellow]达到运行超时[/yellow]"
         self.console.print(f"[dim]{footer}[/dim]")
         return result.final_text
 
-    def _repair_dangling(self) -> None:
+    def _repair_dangling(self, note: str = "Interrupted by user") -> None:
         """防御：若最后一条助手消息带未回应的 tool_use，补合成 tool_result。"""
         if not self.messages:
             return
+
         last = self.messages[-1]
-        if last.role != "assistant":
+        if last.role == "assistant":
+            assistant = last
+            calls = assistant.tool_uses()
+            if not calls:
+                return
+            result_message = Message(
+                role="user",
+                content=[
+                    ToolResultBlock(tool_use_id=call.id, content=note, is_error=True)
+                    for call in calls
+                ],
+            )
+            self.messages.append(result_message)
+            assistant_index = len(self.messages) - 2
+        elif len(self.messages) >= 2:
+            assistant = self.messages[-2]
+            calls = assistant.tool_uses() if assistant.role == "assistant" else []
+            result_blocks = [
+                block for block in last.content if isinstance(block, ToolResultBlock)
+            ]
+            if (
+                not calls
+                or len(result_blocks) != len(last.content)
+                or [block.tool_use_id for block in result_blocks]
+                != [call.id for call in calls]
+            ):
+                return
+            result_message = last
+            assistant_index = len(self.messages) - 2
+        else:
             return
-        calls = last.tool_uses()
-        if not calls:
+
+        store = self._ensure_store()
+        persisted = SessionStore.load_messages(store.path)
+        before_pair = self.messages[:assistant_index]
+        through_assistant = self.messages[: assistant_index + 1]
+        through_result = self.messages[: assistant_index + 2]
+
+        # append_message may have completed its write before surfacing an
+        # error. Reload first so retrying never duplicates the tool result.
+        if persisted == through_result:
             return
-        repair = Message(
-            role="user",
-            content=[
-                ToolResultBlock(
-                    tool_use_id=c.id, content="Interrupted by user", is_error=True
-                )
-                for c in calls
-            ],
+        if persisted == before_pair:
+            store.append_message(assistant)
+            persisted = through_assistant
+        if persisted == through_assistant:
+            store.append_message(result_message)
+            return
+        raise RuntimeError(
+            "session history diverged while repairing a dangling tool result"
         )
-        self.messages.append(repair)
-        self._persist(repair)

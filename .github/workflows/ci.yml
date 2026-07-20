@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+          version: "0.11.29"
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Lint
+        run: uv run --frozen ruff check .
+
+      - name: Test
+        run: uv run --frozen pytest -q
+
+      - name: Offline contract evaluations
+        run: uv run --frozen python -m evals.run_contracts --json
+
+      - name: CLI smoke test
+        run: uv run --frozen emiya --version
+
+  package:
+    name: Build and verify distributions
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+          version: "0.11.29"
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Audit release artifact contents
+        run: uv run --no-project --python 3.12 python scripts/verify_release_artifacts.py --dist-dir dist
+
+      - name: Install wheel into a clean environment
+        run: |
+          uv venv .release-venv --python 3.12
+          uv pip install --python .release-venv/bin/python dist/*.whl
+          uv pip check --python .release-venv/bin/python
+
+      - name: Verify installed metadata and CLI
+        run: |
+          mkdir .release-smoke
+          cd .release-smoke
+          ../.release-venv/bin/python -c "import importlib.metadata as m; import emiya_agent; assert m.version('emiya-agent') == emiya_agent.__version__"
+          ../.release-venv/bin/emiya --version

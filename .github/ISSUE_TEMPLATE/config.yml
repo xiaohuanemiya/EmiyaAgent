@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 私下报告安全漏洞
+    url: https://github.com/xiaohuanemiya/EmiyaAgent/security/advisories/new
+    about: 审批绕过、越界访问、凭据泄露或未授权执行等问题请勿公开披露。
+
