@@ -19,13 +19,12 @@ from rich.text import Text
 
 from emiya_agent import __version__
 from emiya_agent.agent.control import RunController
-from emiya_agent.agent.completion import complete_text
 from emiya_agent.agent.loop import AgentLoop, LoopResult
 from emiya_agent.agent.prompts import build_system_prompt, load_agent_md
 from emiya_agent.agent.subagent import SubagentSpawner
 from emiya_agent.agent.subagent_tasks import SubagentTaskService
 from emiya_agent.agent.usage import UsageTracker
-from emiya_agent.compaction.manager import CompactionManager
+from emiya_agent.compaction.manager import COMPACT_SYSTEM, CompactionManager
 from emiya_agent.config import Config, config_files_exist, select_environment
 from emiya_agent.errors import ConfigError, ProviderError
 from emiya_agent.hooks import HookDecision, HookEvent, HookRunner
@@ -117,14 +116,6 @@ class Repl:
         self.tools = build_default_registry()
         self.tools.register(SkillTool(self.skills))
         self.tools.register(MemoryTool(self.memory))
-        self.tools.register(
-            TranslateForModelTool(
-                self.providers,
-                config,
-                on_usage=self.usage.add,
-                controller=controller,
-            )
-        )
         self.hooks = HookRunner(
             config.hooks,
             cwd=config.cwd,
@@ -140,6 +131,7 @@ class Repl:
             controller=controller,
             hooks=self.hooks,
         )
+        self.tools.register(TranslateForModelTool(self.spawner, config))
         self.task_service = SubagentTaskService(self.spawner, config)
         self.tools.register(SpawnSubagentTool(self.spawner, self.task_service))
         self.tools.register(SubagentTaskTool(self.task_service))
@@ -289,21 +281,27 @@ class Repl:
     async def run(self) -> None:
         await self._maybe_first_run_init()
         self._banner()
-        await self._connect_mcp()
-        await self.emit_hook_event(
-            HookEvent.SESSION_START,
-            "startup",
-            {"source": "startup", "cwd": str(self.config.cwd)},
-        )
+        session_started = False
         try:
+            await self._connect_mcp()
+            # The session exists before observers run.  Mark it first so a
+            # cancelled SessionStart hook still receives a paired SessionEnd
+            # and cannot bypass resource cleanup.
+            session_started = True
+            await self.emit_hook_event(
+                HookEvent.SESSION_START,
+                "startup",
+                {"source": "startup", "cwd": str(self.config.cwd)},
+            )
             await self._main_loop()
         finally:
             try:
-                await self.emit_hook_event(
-                    HookEvent.SESSION_END,
-                    "exit",
-                    {"reason": "exit", "session_id": self.session_id},
-                )
+                if session_started:
+                    await self.emit_hook_event(
+                        HookEvent.SESSION_END,
+                        "exit",
+                        {"reason": "exit", "session_id": self.session_id},
+                    )
             finally:
                 try:
                     await self.task_service.shutdown()
@@ -322,8 +320,10 @@ class Repl:
         self.last_result = None
         self.last_error = None
         self.last_error_kind = None
+        session_started = False
         try:
             await self._connect_mcp()
+            session_started = True
             await self.emit_hook_event(
                 HookEvent.SESSION_START,
                 "one-shot",
@@ -332,11 +332,12 @@ class Repl:
             return await self._execute_turn(text) is not None
         finally:
             try:
-                await self.emit_hook_event(
-                    HookEvent.SESSION_END,
-                    "exit",
-                    {"reason": "exit", "session_id": self.session_id},
-                )
+                if session_started:
+                    await self.emit_hook_event(
+                        HookEvent.SESSION_END,
+                        "exit",
+                        {"reason": "exit", "session_id": self.session_id},
+                    )
             finally:
                 try:
                     await self.task_service.shutdown()
@@ -440,19 +441,13 @@ class Repl:
     # ------------------------------------------------------------- 压缩
 
     async def _compactor_complete(self, system: str, text: str) -> str:
-        route = self.config.route("compactor")
-        provider, model = self.providers.get(route)
-        result, usage = await complete_text(
-            provider,
-            model,
-            system,
+        if system != COMPACT_SYSTEM:
+            raise ValueError("unexpected compactor system prompt")
+        return await self.spawner.spawn_internal(
+            "compactor",
             text,
-            max_tokens=self.config.max_tokens,
-            route=route,
-            controller=self.controller,
+            self.tool_ctx,
         )
-        self.usage.add(route, usage)
-        return result
 
     async def maybe_compact(self, force: bool = False) -> None:
         """超阈值自动压缩；force=True 为 /compact 手动触发。"""
@@ -600,23 +595,32 @@ class Repl:
             controller=self.controller,
             hooks=self.hooks,
         )
+        stop_reason: str | None = None
         try:
             result = await loop.run(
                 self.messages, system=self.system, ctx=self.tool_ctx
             )
         except ProviderError as exc:
+            stop_reason = "provider_error"
             self._repair_dangling()
             self.last_error = str(exc)
             self.last_error_kind = "provider"
             self.console.print(f"[red]{exc}[/red]")
             return None
         except (KeyboardInterrupt, EOFError):
+            stop_reason = "interrupted"
             self.tool_ctx.cancel.set()
             self._repair_dangling()
             self.last_result = LoopResult(final_text="", stop_reason="interrupted")
             self.console.print("\n[yellow]已中断本轮。[/yellow]")
             return None
+        except asyncio.CancelledError:
+            stop_reason = "cancelled"
+            self.tool_ctx.cancel.set()
+            self._repair_dangling()
+            raise
         except Exception as exc:
+            stop_reason = "execution_error"
             # AgentLoop commits protocol messages to memory before invoking
             # the persistence callback. If that callback (or a later
             # integration) fails, repair the JSONL suffix without hiding the
@@ -629,21 +633,24 @@ class Repl:
                     f"tool result: {type(repair_exc).__name__}: {repair_exc}"
                 )
             raise
-
-        self.last_result = result
-        await self.emit_hook_event(
-            HookEvent.STOP,
-            result.stop_reason,
-            {
-                "stop_reason": result.stop_reason,
-                "route": self.route,
-                "session_id": self.session_id,
-            },
-        )
-        text_result = self._report_result(result)
-        if not self.automation:
-            await self.maybe_compact()
-        return text_result
+        else:
+            self.last_result = result
+            stop_reason = result.stop_reason
+            text_result = self._report_result(result)
+            if not self.automation:
+                await self.maybe_compact()
+            return text_result
+        finally:
+            if stop_reason is not None:
+                await self.emit_hook_event(
+                    HookEvent.STOP,
+                    stop_reason,
+                    {
+                        "stop_reason": stop_reason,
+                        "route": self.route,
+                        "session_id": self.session_id,
+                    },
+                )
 
     def _report_result(self, result: LoopResult) -> str | None:
         if result.stop_reason == "refusal":

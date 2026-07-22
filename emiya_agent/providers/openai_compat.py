@@ -4,11 +4,12 @@
 - 内部 tool_use.input(dict) ↔ OpenAI tool_calls.function.arguments(JSON 字符串)
 - 内部 user 消息内的 tool_result 块 ↔ 独立的 role:"tool" 消息（每结果一条）
 - 内部 system 字段 ↔ 首条 role:"system" 消息
-- DeepSeek 的 reasoning_content ↔ 内部 ThinkingBlock（无签名，不回传）
+- DeepSeek 的 reasoning_content ↔ 内部 ThinkingBlock（无签名；工具续接时回传）
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, AsyncIterator
 
@@ -69,6 +70,19 @@ _THINKING_INDEX = 0
 _TEXT_INDEX = 1
 _TOOL_INDEX_BASE = 2
 
+
+def openai_endpoint_identity(provider_name: str, base_url: str | None) -> str:
+    """Stable, non-plaintext provenance for endpoint-private reasoning."""
+
+    normalized = (base_url or "<sdk-default>").rstrip("/")
+    endpoint_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"openai-compatible:{provider_name}:{endpoint_digest}"
+
+
+_DEEPSEEK_REASONING_SOURCE = openai_endpoint_identity(
+    "deepseek", "https://api.deepseek.com"
+)
+
 # 内部 effort → OpenAI reasoning_effort（仅 gpt-5/o 系推理模型支持）
 _REASONING_EFFORT_MAP = {
     "low": "low",
@@ -88,7 +102,12 @@ def reasoning_effort_for(provider_name: str, model: str, effort: str | None) -> 
     return _REASONING_EFFORT_MAP.get(effort)
 
 
-def to_openai_messages(req: ChatRequest) -> list[dict[str, Any]]:
+def to_openai_messages(
+    req: ChatRequest,
+    *,
+    replay_tool_reasoning: bool = False,
+    reasoning_source: str = _DEEPSEEK_REASONING_SOURCE,
+) -> list[dict[str, Any]]:
     msgs: list[dict[str, Any]] = []
     if req.system:
         msgs.append({"role": "system", "content": req.system})
@@ -110,8 +129,26 @@ def to_openai_messages(req: ChatRequest) -> list[dict[str, Any]]:
             msg: dict[str, Any] = {"role": "assistant", "content": text or None}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
+                if replay_tool_reasoning:
+                    # DeepSeek requires the content field to be present and
+                    # non-null on replayed assistant tool-call messages.
+                    msg["content"] = text
+                    # DeepSeek 思考模式要求：发生 tool call 的 assistant 轮次必须在
+                    # 后续子请求中原样带回 reasoning_content，否则 API 返回 400。
+                    # Anthropic thinking 带不透明 signature，跨供应商时不能回传。
+                    reasoning_blocks = [
+                        b
+                        for b in m.content
+                        if isinstance(b, ThinkingBlock)
+                        and b.signature is None
+                        and b.source == reasoning_source
+                    ]
+                    if reasoning_blocks:
+                        msg["reasoning_content"] = "".join(
+                            block.thinking for block in reasoning_blocks
+                        )
             msgs.append(msg)
-            # ThinkingBlock 出站丢弃（跨供应商不可回传）
+            # 普通历史 thinking 与带签名的 Anthropic thinking 均不回传。
         else:
             # tool_result 必须先于同轮的用户文本（紧跟 assistant 的 tool_calls）
             for b in m.content:
@@ -152,7 +189,7 @@ class ChunkAggregator:
     与网络解耦，便于用 SimpleNamespace 伪分片做单测。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, thinking_source: str | None = None) -> None:
         self._text: list[str] = []
         self._thinking: list[str] = []
         self._tool_calls: dict[int, dict[str, Any]] = {}  # index → {id,name,args}
@@ -160,6 +197,7 @@ class ChunkAggregator:
         self._usage: Any = None
         self._text_started = False
         self._thinking_started = False
+        self._thinking_source = thinking_source
 
     def feed(self, chunk: Any) -> list[StreamEvent]:
         events: list[StreamEvent] = []
@@ -226,7 +264,11 @@ class ChunkAggregator:
     def finalize(self) -> MessageDone:
         blocks: list[Any] = []
         if self._thinking:
-            blocks.append(ThinkingBlock(thinking="".join(self._thinking)))
+            blocks.append(
+                ThinkingBlock(
+                    thinking="".join(self._thinking), source=self._thinking_source
+                )
+            )
         if self._text:
             blocks.append(TextBlock(text="".join(self._text)))
         for idx in sorted(self._tool_calls):
@@ -272,11 +314,19 @@ class OpenAICompatProvider(Provider):
     def __init__(self, name: str, api_key: str, base_url: str | None = None) -> None:
         self.name = name  # "openai" | "deepseek"
         self._client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # OPENAI_BASE_URL can supply the effective endpoint when base_url=None.
+        self._endpoint_identity = openai_endpoint_identity(
+            name, str(self._client.base_url)
+        )
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[StreamEvent]:
         kwargs: dict[str, Any] = {
             "model": req.model,
-            "messages": to_openai_messages(req),
+            "messages": to_openai_messages(
+                req,
+                replay_tool_reasoning=self.name == "deepseek",
+                reasoning_source=self._endpoint_identity,
+            ),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -290,7 +340,7 @@ class OpenAICompatProvider(Provider):
         if reasoning:
             kwargs["reasoning_effort"] = reasoning
 
-        agg = ChunkAggregator()
+        agg = ChunkAggregator(thinking_source=self._endpoint_identity)
         try:
             stream = await self._client.chat.completions.create(**kwargs)
             async for chunk in stream:

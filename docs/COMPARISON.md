@@ -24,7 +24,7 @@
 | 扩展生态 | Skills、MCP、Hook 和内部 Python 工具注册；尚无版本化公共插件接口 | OpenCode 支持本地及 npm 插件并自动加载依赖（[Plugins](https://opencode.ai/docs/plugins/)）；Claude Code 插件可打包 skills、agents、hooks、MCP 与 LSP（[Plugins](https://code.claude.com/docs/en/plugins)）；Codex CLI 提供插件安装和 marketplace 管理（[CLI reference](https://developers.openai.com/codex/cli/reference/#codex-plugin)） | 这是明显生态差距；在定义权限、数据流、生命周期和兼容版本前，不应把内部 Python API 宣称为稳定插件 API |
 | 产品界面与远程运行 | 终端 REPL 与一次性 CLI | OpenCode 有 TUI、桌面（[official repository](https://github.com/anomalyco/opencode)）、[IDE](https://opencode.ai/docs/ide/)、[Web](https://opencode.ai/docs/web/) 及 [headless server](https://opencode.ai/docs/server/)；Claude Code 覆盖 CLI、桌面、VS Code、JetBrains 与 Web 等界面（[Platforms](https://code.claude.com/docs/en/platforms)）；Codex 官方仓库列出 CLI、IDE、桌面和云端入口（[official repository](https://github.com/openai/codex)） | 终端内可用，但编辑器审阅、远程任务、服务 API 与跨端接续存在较大产品化差距 |
 | 沙箱与进程边界 | 工作区路径约束、环境白名单、Windows Job Object/POSIX 进程组和 worktree；**无 OS sandbox** | Claude Code 的 Bash 沙箱使用 macOS Seatbelt、Linux/WSL2 bubblewrap 并约束文件系统与网络（[Sandboxing](https://code.claude.com/docs/en/sandboxing)）；Codex 本地命令默认运行于受限环境，越界由审批接管（[Sandboxing](https://developers.openai.com/codex/sandboxing/)） | Job、进程组、路径校验和 worktree 都不能等同 OS 沙箱；处理不可信仓库时必须依赖外部低权限环境、容器或虚拟机 |
-| 发布与质量证据 | 跨平台 CI、wheel/sdist 内容与源码一致性审计、干净 wheel 安装门禁、单元测试和离线契约评测（**9 个 contract**：含并行只读、未知工具、取消配对、审批放行/拒绝）；仓库**无 `LICENSE`** | OpenCode 官方仓库采用 MIT（[LICENSE](https://github.com/anomalyco/opencode/blob/dev/LICENSE)）；Codex 官方仓库采用 Apache-2.0（[repository](https://github.com/openai/codex)） | 许可证是公开发布 P0 阻断项；9 个 contract 覆盖核心循环不变量，但仍不含检索/编辑/恢复等端到端案例，不能支撑与成熟产品的质量结论 |
+| 发布与质量证据 | MIT License、跨平台 CI、wheel/sdist 内容与源码一致性审计、干净 wheel 安装门禁、单元测试和离线契约评测（**9 个 contract**：含并行只读、未知工具、取消配对、审批放行/拒绝） | OpenCode 官方仓库采用 MIT（[LICENSE](https://github.com/anomalyco/opencode/blob/dev/LICENSE)）；Codex 官方仓库采用 Apache-2.0（[repository](https://github.com/openai/codex)） | 9 个 contract 覆盖核心循环不变量，但仍不含检索/编辑/恢复等端到端案例，不能支撑与成熟产品的质量结论 |
 
 ## 已缩小的差距
 
@@ -40,11 +40,10 @@
 
 ### P0：公开发布与可信基线
 
-1. **选择并添加 SPDX 许可证。** 当前没有 `LICENSE`，因此不能把仓库描述为允许复制、修改和再分发的开源发行版；许可证必须由维护者决定。
-2. **把评测从 9 个 contract 扩为端到端回归集。** 取消、并行、审批双向与未知工具已入集；仍需覆盖检索、精确编辑、会话恢复、后台任务、MCP/LSP 坏帧与机器输出兼容性，并持续报告已知失败模式。
-3. **冻结机器接口。** 明确 `schema_version = "1"` 的字段语义、事件顺序、退出码和迁移策略，并用兼容性测试约束。
-4. **完成安全发布治理。** 制品内容与源码一致性审计已经进入 CI；仍需演练私密漏洞报告，并明确签名、provenance、安全公告和回滚流程。
-5. **保持边界披露为发布门禁。** 在实现更强隔离前，所有入口都应明确提示“无 OS sandbox”；stdio MCP 后代进程是否彻底回收仍依赖 MCP SDK，不能沿用 shell/Hook/LSP 的清理保证。
+1. **把评测从 9 个 contract 扩为端到端回归集。** 取消、并行、审批双向与未知工具已入集；仍需覆盖检索、精确编辑、会话恢复、后台任务、MCP/LSP 坏帧与机器输出兼容性，并持续报告已知失败模式。
+2. **冻结机器接口。** 明确 `schema_version = "1"` 的字段语义、事件顺序、退出码和迁移策略，并用兼容性测试约束。
+3. **完成安全发布治理。** 制品内容与源码一致性审计已经进入 CI；仍需演练私密漏洞报告，并明确签名、provenance、安全公告和回滚流程。
+4. **保持边界披露为发布门禁。** 在实现更强隔离前，所有入口都应明确提示“无 OS sandbox”；stdio MCP 后代进程是否彻底回收仍依赖 MCP SDK，不能沿用 shell/Hook/LSP 的清理保证。
 
 ### P1：可靠性、诊断与日常工作流
 

@@ -23,6 +23,30 @@ class ThinkingBlock(BaseModel):
     type: Literal["thinking"] = "thinking"
     thinking: str = ""
     signature: str | None = None
+    # Provider-private thinking material may only be replayed to the endpoint
+    # that produced it.  ``None`` is retained for pre-origin session records.
+    source: str | None = None
+
+
+class RedactedThinkingBlock(BaseModel):
+    """Anthropic 返回的加密思考块；工具续接时必须原样回传。"""
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+    source: str | None = None
+
+
+class FallbackBlock(BaseModel):
+    """Anthropic server-side fallback boundary, stored as opaque JSON data.
+
+    The boundary has provider validation semantics, so it must survive session
+    persistence byte-for-byte at the JSON value level.  ``source`` is internal
+    provenance and is never emitted as part of the provider content block.
+    """
+
+    type: Literal["fallback"] = "fallback"
+    data: dict[str, Any]
+    source: str | None = None
 
 
 class ToolUseBlock(BaseModel):
@@ -40,7 +64,12 @@ class ToolResultBlock(BaseModel):
 
 
 ContentBlock = Annotated[
-    TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock,
+    TextBlock
+    | ThinkingBlock
+    | RedactedThinkingBlock
+    | FallbackBlock
+    | ToolUseBlock
+    | ToolResultBlock,
     Field(discriminator="type"),
 ]
 

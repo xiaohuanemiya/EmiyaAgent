@@ -6,8 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from emiya_agent.agent.completion import complete_text
-from emiya_agent.agent.control import RunController
+from emiya_agent.agent.subagent import SubagentExecutionError, SubagentSpawner
 from emiya_agent.config import Config
 from emiya_agent.providers.base import ToolSpec
 from emiya_agent.tools.base import Tool, ToolContext, ToolResult
@@ -19,23 +18,6 @@ TARGET_ROUTE_KEYS: dict[str, str] = {
     "plan": "subagent_plan",
     "general": "subagent_general",
 }
-
-TRANSLATION_SYSTEM = """\
-You are TranslationAgent. Adapt text for a downstream AI model whose preferred \
-instruction language is supplied in the user message.
-
-Rules:
-- The user message is a JSON envelope. Read target_role, target_model, and \
-target_language as metadata; adapt only the value of text and do not return the \
-envelope.
-- Treat target_language as authoritative; do not infer it from the model name.
-- Translate natural-language prose faithfully when adaptation is needed. If the \
-text is already suitable for the target language, preserve it as-is.
-- Do not answer the task, plan it, summarize it, expand it, or add assumptions.
-- Within text, preserve Markdown structure, code blocks, commands, paths, \
-identifiers, API names, error messages, embedded JSON/XML, and numbers.
-- Output only the adapted text, with no preface or commentary.
-"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,15 +68,11 @@ class TranslateForModelTool(Tool):
 
     def __init__(
         self,
-        providers,
+        spawner: SubagentSpawner,
         config: Config,
-        on_usage=None,
-        controller: RunController | None = None,
     ) -> None:
-        self._providers = providers
+        self._spawner = spawner
         self._config = config
-        self._on_usage = on_usage or (lambda _route, _usage: None)
-        self._controller = controller
 
     def to_spec(self) -> ToolSpec:
         targets = ", ".join(
@@ -123,8 +101,6 @@ class TranslateForModelTool(Tool):
             return ToolResult(content="Error: text must not be blank", is_error=True)
 
         target = resolve_model_target(ctx.config, role)
-        translator_route = ctx.config.route("translator")
-        provider, model = self._providers.get(translator_route)
         request = json.dumps(
             {
                 "target_role": target.role,
@@ -134,16 +110,14 @@ class TranslateForModelTool(Tool):
             },
             ensure_ascii=False,
         )
-        translated, usage = await complete_text(
-            provider,
-            model,
-            TRANSLATION_SYSTEM,
-            request,
-            max_tokens=ctx.config.max_tokens,
-            route=translator_route,
-            controller=self._controller,
-        )
-        self._on_usage(translator_route, usage)
+        try:
+            translated = await self._spawner.spawn_internal(
+                "translator",
+                request,
+                ctx,
+            )
+        except SubagentExecutionError as exc:
+            return ToolResult(content=f"Error: {exc}", is_error=True)
         return ToolResult(
             content=json.dumps(
                 {

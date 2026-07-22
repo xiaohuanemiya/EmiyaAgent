@@ -8,8 +8,9 @@
 
 ### Added
 
+- 采用 MIT License，并在 Python 包元数据及发布制品中声明许可证。
 - Hook 事件面从工具事件扩展到生命周期：新增 `UserPromptSubmit`、`SessionStart`、`SessionEnd`、`Stop`、`SubagentStop`、`PreCompact`、`PostCompact`。决策型事件（`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`PreCompact`）的聚合决策实际拦截动作；其余为观测型，`deny` 不改变控制流。`matcher` 语义泛化为按事件主题匹配（工具名/提示词/来源/停止原因/触发方式）。
-- 脱敏自检：REPL `/doctor` 与 CLI `emiya doctor [--json]`。报告覆盖版本、配置来源与警告、provider 凭据来源（绝不含 key 值）、角色路由可用性、Hook/MCP/LSP 概览与会话状态；URL 去除 userinfo/query，命令只保留可执行文件名；存在 fail 级检查项时退出码为 3。
+- 脱敏自检：REPL `/doctor` 与 CLI `emiya doctor [--json]`。报告覆盖版本、配置来源与警告、provider 凭据来源（绝不含 key 值）、角色路由可用性、Hook/MCP/LSP 概览与会话状态；URL 仅保留 origin，命令只保留可执行文件名；存在 fail 级检查项时退出码为 3。
 - 离线契约评测从 5 个扩展到 9 个：新增并行只读工具免审批、未知工具错误配对后继续、串行批次中途取消的剩余调用配对、审批放行恰好执行一次。
 
 - 用户级完整命令 `shell_rules`，支持有序的 `allow`、`ask`、`deny` 决策。
@@ -27,6 +28,8 @@
 
 ### Changed
 
+- DeepSeek 工具续接会按端点来源原样回传该 assistant 轮次的 `reasoning_content`，并保留非空 `content` 字段；Anthropic 的签名思考、`redacted_thinking` 与服务端 `fallback` 边界作为带来源的不透明 content block 持久化，仅向原端点回传。
+- 统一核心模型调用边界：`executor` 是唯一根 Agent；`explore`/`plan`/`general` 作为公共可委派子 Agent，translator/compactor 改为宿主内部使用的无工具、单轮隔离子 Agent，且不暴露给 `spawn_subagent`。工具、MCP、LSP、Hook 与 provider 传输继续作为能力或协议边界，不误包装为子 Agent。
 - 普通 REPL 与一次性输入现在统一原样交给主 Agent；是否调用 `explore`、`plan`、`general` 或 translator 由 Agent 按任务收益自主决定，不再因中文字符自动进入 plan。
 - 删除 `/lang`、`/spec`、顶层 `language` 配置及旧的固定规格/翻译管线；旧配置必须移除顶层 `language`。provider/model 的 `lang` 现作为下一跳模型主要语言，由 `translate_for_model` 动态解析并传给 translator Agent，调用方不能覆盖目标语言。
 - 未信任项目的 `.emiyacode/config.toml` 现在整层忽略；用户显式 `/trust` 后才参与配置叠加。
@@ -36,6 +39,10 @@
 
 ### Security
 
+- `doctor` 不再回显 TOML/Pydantic 原始错误输入、URL path 或未经分类的加载警告；非法端口和畸形 URL 也会安全降级。
+- 免审批 `grep` 只执行绝对 `PATH` 中且位于工作区外的原生 ripgrep，使用最小无凭据环境、有界输出与 Windows Job Object/POSIX 进程组；找不到安全可执行文件时失败关闭，避免 Python 回退跟随链接或运行无界正则。
+- Skill 在发现和按需读取时使用受限句柄，并重新校验根目录、路径、文件身份及内容摘要，拒绝竞态链接、文件及目录替换；磁盘读取转入工作线程。
+- `Stop`/`SubagentStop` 在 provider 失败、内部异常和取消路径仍会发出；取消 `SessionStart` 也不会绕过任务、LSP、MCP 与会话写者清理。
 - 文件、会话、记忆、技能、项目指令和 worktree 路径增加符号链接、junction/reparse point、硬链接与越界检查。
 - 工具协议在拒绝、解析失败和中断路径补齐配对错误结果，非法或重复工具调用 ID 不再进入活跃历史或执行副作用。
 - 会话创建采用不覆盖的原子发布；恢复会跳过单条损坏/未知记录，并修复完整历史中的悬空工具调用。

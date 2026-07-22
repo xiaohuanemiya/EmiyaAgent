@@ -8,22 +8,27 @@ EmiyaAgent 是一个 Python 终端应用。REPL 与一次性 CLI 共享同一套
 
 ```mermaid
 flowchart LR
-    UI["CLI / REPL"] --> LOOP["AgentLoop"]
-    LOOP --> ROUTE["Provider 路由"]
+    UI["CLI / REPL"] --> ROOT["根 AgentLoop：executor"]
+    ROOT --> ROUTE["Provider 路由"]
     ROUTE --> API["外部模型 API"]
-    LOOP --> TOOLS["工具注册表"]
-    TOOLS --> TRANS["translate_for_model"]
-    TRANS --> ROUTE
+    ROOT --> TOOLS["工具注册表"]
     TOOLS --> LOCAL["文件 / Shell / Git"]
-    TOOLS --> EXT["MCP / Hook / LSP"]
-    LOOP --> SUB["前台与后台子 agent"]
+    TOOLS --> EXT["MCP / LSP"]
+    ROOT --> HOOK["策略与生命周期 Hook"]
+    ROOT -->|"公开委派 explore / plan / general"| SPAWN["SubagentSpawner"]
+    TOOLS -->|"translate_for_model"| SPAWN
+    UI -->|"自动或 /compact"| COMPACT["CompactionManager"]
+    COMPACT --> SPAWN
+    SPAWN --> SUB["隔离 AgentLoop"]
+    SUB --> ROUTE
+    SUB --> HOOK
     UI --> STORE[".emiyacode 会话与记忆"]
     UI --> CTRL["轮次 / 超时 / USD 预算"]
-    CTRL --> LOOP
+    CTRL --> ROOT
     CTRL --> SUB
 ```
 
-箭头表示控制流或数据流，不表示隔离。`API` 和远程 HTTP MCP 位于本机信任边界之外；本地 shell、Hook、stdio MCP、LSP 与子 agent 则继承当前用户权限。
+箭头表示控制流或数据流，不表示进程或权限隔离。`executor` 是唯一根 Agent；图中的隔离 `AgentLoop` 包括公开委派角色和内部专用角色。工具、MCP、LSP、Hook 与 provider 传输本身不进行 EmiyaAgent 模型推理，因此不是子 Agent。`API` 和远程 HTTP MCP 位于本机信任边界之外；本地 shell、Hook、stdio MCP、LSP 与子 Agent 则继承当前用户权限。
 
 ## 分层与职责
 
@@ -49,9 +54,14 @@ flowchart LR
 
 ### Agent 自主编排、翻译交接与模型路由
 
-REPL 与一次性 CLI 都把普通输入原样交给主 `AgentLoop`。是否直接处理、调用工具或派生 `explore`、`plan`、`general`，由主 Agent 根据任务复杂度、风险和独立并行收益决定；宿主层不根据语言或关键字预先选择 plan，也没有固定的角色调用链。
+REPL 与一次性 CLI 都把普通输入原样交给 `executor` 的主 `AgentLoop`。它是唯一持有顶层会话、用户交互和工具编排权的根 Agent；把它再次包装成子 Agent 会丢失这层所有权，因此不属于派生范围。是否直接处理、调用工具或派生 `explore`、`plan`、`general`，由主 Agent 根据任务复杂度、风险和独立并行收益决定；宿主层不根据语言或关键字预先选择 plan，也没有固定的角色调用链。
 
-`ProviderConfig.lang` 与 model 级 `lang` 描述模型的主要指令语言，`Config.model_lang()` 按“model 覆盖 → provider 默认”解析。`translate_for_model` 的工具规格动态展示 executor/explore/plan/general 当前路由与语言；主 Agent 只有在复杂或精度敏感的跨语言交接确有收益时才调用 translator。工具依据目标角色解析权威目标语言，将目标角色、模型路由、语言和原文交给固定职责的 TranslationAgent；调用方不能传入目标语言。TranslationAgent 只做等价语言适配，不规划、不扩写、不执行任务。同语言、短文本和代码为主的交接直接进行。
+除根 `executor` 外，EmiyaAgent 的核心生成式调用统一由 `SubagentSpawner` 创建隔离的 `AgentLoop`。角色分为两组：
+
+- 可委派角色：`explore`、`plan`、`general`，可以由主 Agent 通过公共 `spawn_subagent` 工具选择，也可以进入后台任务队列；
+- 内部专用角色：translator、compactor，只能由宿主的翻译工具和压缩管理器启动，不出现在 `spawn_subagent` 的公共角色枚举中。二者使用空工具注册表、独立消息列表，不注入项目/Skill 共享上下文，静默且最多运行一轮。
+
+`ProviderConfig.lang` 与 model 级 `lang` 描述模型的主要指令语言，`Config.model_lang()` 按“model 覆盖 → provider 默认”解析。`translate_for_model` 的工具规格动态展示 executor/explore/plan/general 当前路由与语言；主 Agent 只有在复杂或精度敏感的跨语言交接确有收益时才调用 translator。工具依据目标角色解析权威目标语言，将目标角色、模型路由、语言和原文交给固定职责的 translator 子 Agent；调用方不能传入目标语言。translator 只做等价语言适配，不规划、不扩写、不执行任务。同语言、短文本和代码为主的交接直接进行。compactor 则由自动阈值或 `/compact` 触发，只负责把旧轮次压缩成摘要。
 
 `executor`、`translator`、`compactor` 与三类子 agent 各自独立路由；因此一次任务可能访问多个 provider。`/route` 或 `/model` 改变下一跳后，翻译工具的下一次规格导出会立即反映新模型语言，而主系统提示词仍保持会话内字节级稳定。
 
@@ -61,7 +71,7 @@ REPL 与一次性 CLI 都把普通输入原样交给主 `AgentLoop`。是否直�
 
 ### 内部消息模型
 
-`emiya_agent/types.py` 的 `Message` 与 content block 是唯一内部消息真源。文本、思考、工具调用和工具结果都以显式块表达；Provider 特有格式只在适配器边界转换。
+`emiya_agent/types.py` 的 `Message` 与 content block 是唯一内部消息真源。文本、思考、工具调用和工具结果都以显式块表达；Provider 特有格式只在适配器边界转换。DeepSeek 在工具续接时要求回传同一 assistant 轮次的 `reasoning_content`；Anthropic 的签名思考、加密 `redacted_thinking` 和服务端 `fallback` 边界使用带端点来源的不透明块保存。所有此类 Provider 私有内容只向来源完全匹配的端点回传，无来源的旧记录失败关闭。
 
 关键不变量：
 
@@ -92,15 +102,17 @@ Hook 命令以 argv 直接启动，不经过 shell；stdin 是有界 JSON 事件
 
 ### 工具、MCP 与 LSP
 
-`emiya_agent/tools` 的工具通过稳定 schema 注册。文件工具默认把解析后的路径限制在工作区，拒绝越界路径和重定向符号链接；写操作默认审批。磁盘与遍历 I/O 通过 `asyncio.to_thread` 避免阻塞事件循环。
+`emiya_agent/tools` 的工具通过稳定 schema 注册。文件工具默认把解析后的路径限制在工作区，拒绝越界路径和重定向符号链接；写操作默认审批。磁盘与遍历 I/O 通过 `asyncio.to_thread` 避免阻塞事件循环。免审批 `grep` 只从绝对 `PATH` 目录解析工作区外的 ripgrep，以最小环境和进程树收容执行；不可安全解析时失败关闭并提示安装 ripgrep。Skill 的发现和按需加载均会通过受限句柄读取，并重新校验根目录身份、路径边界、文件身份和内容摘要，拒绝竞态替换。
 
 MCP manager 在启动阶段连接可信配置中的 stdio 或 streamable-HTTP server，并把远端工具注册为 `mcp__<server>__<tool>`。stdio server 是本地进程；其裸命令只在白名单环境中的绝对 `PATH` 目录解析，连接关闭和子进程生命周期由 MCP SDK 管理，当前没有 shell/Hook/LSP 的 Job Object 或进程组级后代清理保证。HTTP server 是外部数据接收方。MCP 工具仍经过主循环审批和 Hook。
 
 LSP manager 按文件扩展名和优先级选择已安装的 server，不调用包管理器、不自动下载。连接以 server/root 为键按需复用；首次启动在 `ask` 模式下显示解析后的命令和项目根。工具把一基、Unicode 码点列转换为协议位置，限制文档与返回 URI 在工作区内，并对帧、通知、stderr、结果和超时设置上限。查询接口是只读的，但 language server 自身可能加载插件、构建配置或访问网络。
 
-### 子 agent 与后台任务
+这些组件与 Hook、provider 适配器都是根 Agent 或子 Agent 使用的能力/传输边界，而不是独立的模型调用。即使某个 MCP server 背后连接了外部 AI 服务，在 EmiyaAgent 内它仍表现为受 schema、审批和 Hook 约束的工具调用，不会被包装成 EmiyaAgent 子 Agent。
 
-前台子 agent 使用隔离消息上下文，并按角色获得工具子集：`explore`/`plan` 面向只读调查和设计，`general` 可使用完整能力。父子 agent 共享全局运行控制器，因此模型请求次数、总超时、usage 和 USD 预算不会因派生而重置。
+### 子 Agent、内部专用角色与后台任务
+
+可委派子 Agent 使用隔离消息上下文，并按角色获得工具子集：`explore`/`plan` 面向只读调查和设计，`general` 可使用完整能力。内部 translator/compactor 同样通过隔离 `AgentLoop` 发起模型请求，但不持有任何工具，也不能继续派生。根 Agent 与全部子 Agent 共享全局运行控制器，因此模型请求次数、总超时、usage 和 USD 预算不会因派生而重置。
 
 后台任务由有界队列管理并拥有独立取消信号：
 
@@ -124,7 +136,7 @@ worktree 只隔离代码目录和 Git 状态，不是进程、凭据或网络沙
 
 ### 全局运行控制
 
-`emiya_agent/agent/control.py` 为一次运行维护单一控制器，执行器、翻译、压缩和所有子 agent 共用：
+`emiya_agent/agent/control.py` 为一次运行维护单一控制器，根 executor、三类可委派子 Agent 和 translator/compactor 内部子 Agent 共用：
 
 - 模型请求/轮次上限；
 - 以单调时钟计算的总超时；
@@ -132,6 +144,8 @@ worktree 只隔离代码目录和 Git 状态，不是进程、凭据或网络沙
 - 根据模型配置单价计算的 USD 预算。
 
 启用费用预算但当前路由缺少有效定价时会失败关闭。单个在途请求可能在收到权威 usage 前轻微越过预算；一旦确认达到限制，不再发起后续请求或执行该响应中的工具调用。
+
+费用总量仍聚合所有角色，但 usage 的“最近一次请求”按执行 scope 隔离：根 executor 使用 `main`，前台委派角色使用 `subagent:<role>`，内部角色使用 `internal:<role>`，后台任务使用任务 ID。即使多个角色配置成同一模型路由，translator、compactor 或其他子 Agent 也不会覆盖 executor 用于触发压缩的样本。
 
 ## 并发、取消与资源关闭
 

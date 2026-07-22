@@ -514,8 +514,42 @@ def _read_toml(path: Path) -> dict[str, Any]:
     try:
         # utf-8-sig: Windows 记事本/PowerShell 写的 UTF-8 常带 BOM
         return dict(tomlkit.parse(path.read_text(encoding="utf-8-sig")))
-    except Exception as exc:  # tomlkit 解析错误
-        raise ConfigError(f"配置文件解析失败 {path}: {exc}") from exc
+    except Exception:  # tomlkit 解析错误
+        # 解析器错误可能回显原始 token/行内容；配置文件可含明文
+        # 凭据，因此面向用户的 warning 不带底层异常文本。
+        raise ConfigError(f"配置文件解析失败 {path}") from None
+
+
+def _validation_error_summary(exc: ValidationError) -> str:
+    """生成不回显 Pydantic input_value 的配置错误摘要。
+
+    字典键（provider/server/model 名等）同样是用户输入，因此仅显示
+    Config 的已知顶层字段；保留 ``language`` 是为了给旧配置提供
+    可操作的迁移线索。
+    """
+
+    safe_top_level = set(Config.model_fields) | {"language"}
+    fields: set[str] = set()
+    try:
+        errors = exc.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+    except Exception:
+        errors = []
+    for error in errors:
+        location = error.get("loc")
+        if not location:
+            continue
+        top_level = location[0]
+        if isinstance(top_level, str) and top_level in safe_top_level:
+            fields.add(top_level)
+
+    detail = f"配置值校验失败（{exc.error_count()} 项"
+    if fields:
+        detail += "；字段: " + ", ".join(sorted(fields))
+    return detail + "）"
 
 
 def user_config_path() -> Path:
@@ -738,6 +772,6 @@ def load_config(cwd: Path | None = None) -> Config:
             **merged,
         )
     except ValidationError as exc:
-        raise ConfigError(f"配置值校验失败: {exc}") from exc
+        raise ConfigError(_validation_error_summary(exc)) from None
     config.load_warnings = warnings
     return config

@@ -7,7 +7,10 @@ import pytest
 from rich.console import Console
 
 from emiya_agent.config import load_config, user_config_path
-from emiya_agent.providers.anthropic_provider import AnthropicProvider
+from emiya_agent.providers.anthropic_provider import (
+    AnthropicProvider,
+    anthropic_endpoint_identity,
+)
 from emiya_agent.providers.registry import ProviderRegistry
 from emiya_agent.ui.init_wizard import (
     build_catalog,
@@ -146,6 +149,11 @@ async def test_wizard_anthropic_compat_endpoint(tmp_path, isolated_home, monkeyp
 
     provider, model = ProviderRegistry(saved).get("deepseek/deepseek-v4-pro")
     assert isinstance(provider, AnthropicProvider)
+    assert provider.name == "deepseek"
+    assert provider._endpoint_identity == anthropic_endpoint_identity(
+        "deepseek", "https://api.deepseek.com/anthropic"
+    )
+    assert provider._official_endpoint is False
     assert model == "deepseek-v4-pro"
 
 

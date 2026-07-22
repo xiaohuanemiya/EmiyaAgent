@@ -1,18 +1,87 @@
-"""搜索工具：glob（文件名模式）+ grep（内容正则，优先 ripgrep）。"""
+"""搜索工具：glob（文件名模式）+ grep（内容正则，要求安全 ripgrep）。"""
 
 from __future__ import annotations
 
 import asyncio
-import re
-import shutil
+import os
 from pathlib import Path
 from typing import Any, ClassVar
 
+from emiya_agent.config import select_environment
 from emiya_agent.tools.base import Tool, ToolContext, ToolResult, resolve_path
+from emiya_agent.tools.shell import (
+    _ContainmentError,
+    _read_contained_process,
+    _spawn_process_tree,
+)
 
 IGNORED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".emiyacode", "dist"}
 MAX_MATCHES = 200
 MAX_FILES = 100
+RG_TIMEOUT_SECONDS = 60
+_RG_ENV_ALLOWLIST = (
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "LANG",
+    "LC_*",
+)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_rg_executable(workspace: Path) -> Path | None:
+    """Resolve rg only from absolute PATH directories outside the workspace.
+
+    ``shutil.which`` follows Windows' current-directory-first lookup semantics,
+    which lets an untrusted checkout provide ``rg.exe`` to an approval-free
+    read-only tool.  Resolve an absolute executable here and pass that exact
+    path to the contained subprocess instead.
+    """
+
+    workspace_lexical = workspace.absolute()
+    try:
+        workspace_resolved = workspace.resolve(strict=True)
+    except OSError:
+        workspace_resolved = workspace_lexical
+    names = ("rg.exe", "rg.com") if os.name == "nt" else ("rg",)
+    for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = raw_entry.strip().strip('"')
+        if not entry:
+            continue
+        directory = Path(os.path.expandvars(entry))
+        if not directory.is_absolute():
+            continue
+        for name in names:
+            candidate = directory / name
+            if _is_within(candidate.absolute(), workspace_lexical):
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if _is_within(resolved, workspace_resolved):
+                continue
+            if not resolved.is_file():
+                continue
+            if os.name != "nt" and not os.access(resolved, os.X_OK):
+                continue
+            return resolved
+    return None
+
+
+def _rg_environment() -> dict[str, str]:
+    """Return the minimal non-secret environment needed by a native rg."""
+
+    return select_environment(_RG_ENV_ALLOWLIST)
 
 
 def _iter_files(root: Path, pattern: str = "**/*") -> list[Path]:
@@ -81,57 +150,98 @@ class GrepTool(Tool):
         pattern = args["pattern"]
         file_glob = args.get("glob")
 
-        rg = shutil.which("rg")
+        rg = await asyncio.to_thread(_resolve_rg_executable, ctx.cwd)
         if rg:
-            return await self._rg(rg, pattern, root, file_glob)
-        return await asyncio.to_thread(self._python_grep, pattern, root, file_glob)
+            return await self._rg(
+                rg,
+                pattern,
+                root,
+                file_glob,
+                cwd=ctx.cwd,
+                env=_rg_environment(),
+            )
+        return ToolResult(
+            content=(
+                "Error: 未找到工作区外的安全 ripgrep；为避免免审批搜索读取链接目标或"
+                "执行无界正则，已禁用 Python 回退。请安装 ripgrep 并将其绝对目录加入 PATH。"
+            ),
+            is_error=True,
+        )
 
     async def _rg(
-        self, rg: str, pattern: str, root: Path, file_glob: str | None
+        self,
+        rg: str | Path,
+        pattern: str,
+        root: Path,
+        file_glob: str | None,
+        *,
+        cwd: Path,
+        env: dict[str, str],
     ) -> ToolResult:
         # --no-config 避免工作站的 RIPGREP_CONFIG_PATH 改变安全语义；
         # -e 明确把模型输入标记为 pattern，-- 明确结束选项，防止
         # ``--pre=COMMAND`` 一类字符串被 rg 当成可执行选项。
-        argv = [rg, "--no-config", "-n", "--no-heading", "-S", "-m", "50"]
+        executable = Path(rg)
+        if not executable.is_absolute():
+            return ToolResult(
+                content="Error: ripgrep executable must be an absolute path",
+                is_error=True,
+            )
+        argv = [
+            str(executable),
+            "--no-config",
+            "-n",
+            "--no-heading",
+            "-S",
+            "-m",
+            "50",
+        ]
         if file_glob:
             argv.extend(["--glob", file_glob])
         argv.extend(["-e", pattern, "--", str(root)])
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        finally:
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-        if proc.returncode not in (0, 1):  # 1 = 无匹配
+            tree = await _spawn_process_tree(argv, cwd=cwd, env=env)
+        except _ContainmentError as exc:
             return ToolResult(
-                content=f"Error: ripgrep 失败: {stderr.decode('utf-8', 'replace')}",
+                content=f"Error: ripgrep process containment failed: {exc}",
                 is_error=True,
             )
-        text = stdout.decode("utf-8", "replace").strip()
-        lines = text.splitlines()[:MAX_MATCHES]
-        return ToolResult(content="\n".join(lines) or "(no matches)")
+        except OSError as exc:
+            return ToolResult(
+                content=f"Error: ripgrep could not start: {type(exc).__name__}: {exc}",
+                is_error=True,
+            )
 
-    def _python_grep(
-        self, pattern: str, root: Path, file_glob: str | None
-    ) -> ToolResult:
         try:
-            regex = re.compile(pattern)
-        except re.error as exc:
-            return ToolResult(content=f"Error: 非法正则: {exc}", is_error=True)
-        matches: list[str] = []
-        for f in _iter_files(root, f"**/{file_glob}" if file_glob else "**/*"):
-            try:
-                text = f.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                continue
-            for lineno, line in enumerate(text.splitlines(), 1):
-                if regex.search(line):
-                    matches.append(f"{f}:{lineno}:{line.strip()[:300]}")
-                    if len(matches) >= MAX_MATCHES:
-                        return ToolResult(content="\n".join(matches) + "\n... (capped)")
-        return ToolResult(content="\n".join(matches) or "(no matches)")
+            stdout, omitted = await asyncio.wait_for(
+                _read_contained_process(tree), timeout=RG_TIMEOUT_SECONDS
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            return ToolResult(
+                content=f"Error: ripgrep timed out after {RG_TIMEOUT_SECONDS}s",
+                is_error=True,
+            )
+        finally:
+            await tree.terminate()
+
+        raw_text = stdout.decode("utf-8", "replace").strip()
+        truncation_note = (
+            f"[ripgrep output truncated: {omitted} bytes omitted]" if omitted else ""
+        )
+        error_text = (
+            f"{raw_text}\n{truncation_note}"
+            if raw_text and truncation_note
+            else raw_text or truncation_note
+        )
+        if tree.process.returncode not in (0, 1):  # 1 = 无匹配
+            return ToolResult(
+                content=(
+                    f"Error: ripgrep failed with exit code "
+                    f"{tree.process.returncode}: {error_text}"
+                ),
+                is_error=True,
+            )
+        lines = raw_text.splitlines()[:MAX_MATCHES]
+        if truncation_note:
+            lines.append(truncation_note)
+        return ToolResult(content="\n".join(lines) or "(no matches)")

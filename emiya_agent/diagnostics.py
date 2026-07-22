@@ -29,16 +29,40 @@ CheckStatus = str  # "ok" | "warn" | "fail"
 
 
 def _sanitize_url(url: str) -> str:
-    """去掉 URL 中可能包含凭据的部分，只留 scheme://host/path。"""
+    """只保留 HTTP(S) origin，不回显可承载凭据的 URL 部分。"""
     try:
         parts = urlsplit(url)
-    except ValueError:
-        return "(unparseable)"
-    host = parts.hostname or ""
-    if parts.port is not None:
-        host = f"{host}:{parts.port}"
-    scheme = parts.scheme or "https"
-    return f"{scheme}://{host}{parts.path}"
+        scheme = parts.scheme.lower()
+        if scheme not in {"http", "https"}:
+            return "(invalid URL)"
+        host = parts.hostname
+        port = parts.port  # 非法/越界端口会在此抛 ValueError。
+        if not host or any(ord(char) < 32 for char in host):
+            return "(invalid URL)"
+        if ":" in host:  # urlsplit().hostname 会去掉 IPv6 方括号。
+            safe_host = f"[{host}]"
+        else:
+            safe_host = host.encode("idna").decode("ascii")
+    except (AttributeError, TypeError, UnicodeError, ValueError):
+        return "(invalid URL)"
+
+    authority = safe_host if port is None else f"{safe_host}:{port}"
+    # path 同样常用于 bearer token/租户密钥，无法靠启发式可靠
+    # 判断哪个 segment 安全；诊断中因此整体省略。
+    return f"{scheme}://{authority}"
+
+
+def _sanitize_load_warning(warning: Any) -> str:
+    """把内部 warning 映射成有限、不回显原文的诊断类别。"""
+
+    if isinstance(warning, str):
+        if warning.startswith("配置文件解析失败"):
+            return "配置文件解析失败；该配置层已忽略"
+        if warning.startswith("未信任项目配置"):
+            return "存在未信任的项目配置；该配置层已忽略"
+        if warning.startswith("项目配置中的用户级安全策略已忽略"):
+            return "项目配置尝试覆盖用户级安全策略；相关字段已忽略"
+    return "配置加载警告（详细内容已脱敏）"
 
 
 def _check(checks: list[dict[str, Any]], check_id: str, status: CheckStatus, detail: str) -> None:
@@ -57,6 +81,9 @@ def build_report(
     CLI 冷启动时为 None，报告仅含静态配置检查。
     """
     checks: list[dict[str, Any]] = []
+    safe_load_warnings = [
+        _sanitize_load_warning(warning) for warning in config.load_warnings
+    ]
 
     user_path = user_config_path()
     project_path = project_config_path(config.cwd)
@@ -280,7 +307,7 @@ def build_report(
             "project_config_present": project_path.is_file(),
             "project_trusted": config.project_trusted,
             "project_config_ignored": config.project_config_ignored,
-            "load_warnings": list(config.load_warnings),
+            "load_warnings": safe_load_warnings,
             "tool_approval": config.tool_approval,
             "allow_external_paths": config.allow_external_paths,
             "max_tokens": config.max_tokens,

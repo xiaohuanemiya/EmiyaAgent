@@ -56,7 +56,11 @@ class ProviderRegistry:
                     )
                 )
             try:
-                return AnthropicProvider(api_key=api_key, base_url=pc.base_url)
+                return AnthropicProvider(
+                    api_key=api_key,
+                    base_url=pc.base_url,
+                    name=provider_name,
+                )
             except Exception as exc:
                 raise ConfigError(f"Anthropic 协议客户端初始化失败: {exc}") from exc
 

@@ -42,6 +42,8 @@ MAX_METADATA_BYTES = 1024 * 1024
 MAX_TAR_STREAM_BYTES = 320 * 1024 * 1024
 MAX_MEMBER_PATH_UTF16 = 240
 MAX_COMPONENT_UTF16 = 255
+LICENSE_EXPRESSION = "MIT"
+LICENSE_FILENAME = "LICENSE"
 
 _FORBIDDEN_COMPONENTS = frozenset(
     {
@@ -100,6 +102,7 @@ class ProjectMetadata:
     requires_python: str | None
     dependencies: tuple[str, ...]
     readme: str | None
+    license_expression: str
 
     @property
     def wheel_name(self) -> str:
@@ -255,6 +258,7 @@ def _metadata_from_pyproject(data: bytes, *, label: str) -> ProjectMetadata:
     requires_python = project.get("requires-python")
     dependencies = project.get("dependencies", [])
     readme = project.get("readme")
+    license_expression = project.get("license")
     if not isinstance(name, str) or not name.strip():
         _invalid(f"{label} has no valid project name")
     if not isinstance(version, str) or not version.strip():
@@ -272,6 +276,10 @@ def _metadata_from_pyproject(data: bytes, *, label: str) -> ProjectMetadata:
         isinstance(value, str) and value.strip() for value in dependencies
     ):
         _invalid(f"{label} has invalid project dependencies")
+    if license_expression != LICENSE_EXPRESSION:
+        _invalid(
+            f"{label} must declare the {LICENSE_EXPRESSION} license expression"
+        )
     normalized_dependencies = tuple(value.strip() for value in dependencies)
     if len(set(normalized_dependencies)) != len(normalized_dependencies):
         _invalid(f"{label} has duplicate project dependencies")
@@ -288,12 +296,14 @@ def _metadata_from_pyproject(data: bytes, *, label: str) -> ProjectMetadata:
         requires_python=requires_python.strip() if requires_python else None,
         dependencies=normalized_dependencies,
         readme=readme,
+        license_expression=license_expression,
     )
 
 
 def _load_project_metadata(project_root: Path) -> ProjectMetadata:
     try:
         pyproject_data = (project_root / "pyproject.toml").read_bytes()
+        license_data = (project_root / LICENSE_FILENAME).read_bytes()
         init_data = (project_root / "emiya_agent" / "__init__.py").read_text(
             encoding="utf-8"
         )
@@ -301,6 +311,8 @@ def _load_project_metadata(project_root: Path) -> ProjectMetadata:
         raise ArtifactValidationError("project metadata cannot be read") from exc
 
     metadata = _metadata_from_pyproject(pyproject_data, label="project pyproject.toml")
+    if not license_data or len(license_data) > MAX_METADATA_BYTES:
+        _invalid("project LICENSE has an invalid size")
     source_version = _literal_version(
         init_data, label="project emiya_agent/__init__.py"
     )
@@ -550,6 +562,17 @@ def _verify_distribution_metadata_fields(
     ) != sorted(expected.dependencies):
         _invalid(f"{label} dependencies do not match pyproject.toml")
 
+    actual_license_expressions = [
+        str(value).strip() for value in message.get_all("License-Expression", [])
+    ]
+    if actual_license_expressions != [expected.license_expression]:
+        _invalid(f"{label} License-Expression does not match pyproject.toml")
+    actual_license_files = [
+        str(value).strip() for value in message.get_all("License-File", [])
+    ]
+    if actual_license_files != [LICENSE_FILENAME]:
+        _invalid(f"{label} must declare exactly one {LICENSE_FILENAME} license file")
+
 
 def _verify_wheel_descriptor(data: bytes) -> None:
     try:
@@ -639,6 +662,7 @@ def _verify_wheel(path: Path, expected: ProjectMetadata, *, package_root: Path) 
     entry_points_name = f"{expected.dist_info}/entry_points.txt"
     wheel_descriptor_name = f"{expected.dist_info}/WHEEL"
     record_name = f"{expected.dist_info}/RECORD"
+    license_name = f"{expected.dist_info}/licenses/{LICENSE_FILENAME}"
     init_name = "emiya_agent/__init__.py"
     required = {
         metadata_name,
@@ -646,6 +670,7 @@ def _verify_wheel(path: Path, expected: ProjectMetadata, *, package_root: Path) 
         wheel_descriptor_name,
         record_name,
         init_name,
+        license_name,
     }
     members: dict[str, zipfile.ZipInfo] = {}
     canonical_members: set[tuple[str, ...]] = set()
@@ -714,6 +739,16 @@ def _verify_wheel(path: Path, expected: ProjectMetadata, *, package_root: Path) 
             _verify_distribution_metadata_fields(
                 metadata_data, expected, label="wheel METADATA"
             )
+
+            license_info = members[license_name]
+            source_license = package_root.parent / LICENSE_FILENAME
+            source_size, source_digest = _source_digest(source_license)
+            if (
+                source_size != license_info.file_size
+                or _zip_digest(archive, license_info, label="wheel license file")
+                != source_digest
+            ):
+                _invalid("wheel license file does not match the source tree")
 
             descriptor_info = members[wheel_descriptor_name]
             with archive.open(descriptor_info, mode="r") as stream:
@@ -855,6 +890,7 @@ def _verify_sdist(path: Path, expected: ProjectMetadata, *, project_root: Path) 
         "pyproject": "pyproject.toml",
         "init": "emiya_agent/__init__.py",
         "metadata": "PKG-INFO",
+        "license": LICENSE_FILENAME,
     }
     if expected.readme is not None:
         required_suffixes["readme"] = expected.readme

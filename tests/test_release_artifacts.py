@@ -22,12 +22,14 @@ VERSION = "0.1.0"
 WHEEL_NAME = "emiya_agent"
 ROOT_NAME = f"{WHEEL_NAME}-{VERSION}"
 DIST_INFO = f"{WHEEL_NAME}-{VERSION}.dist-info"
+LICENSE_TEXT = b"MIT License\n\nCopyright (c) test fixture\n"
 
 
 def _write_project(root: Path) -> None:
     package = root / "emiya_agent"
     package.mkdir(parents=True)
     (root / "README.md").write_bytes(b"# fixture\n")
+    (root / "LICENSE").write_bytes(LICENSE_TEXT)
     (package / "__init__.py").write_bytes(f'__version__ = "{VERSION}"\n'.encode())
     (package / "cli.py").write_bytes(b"def main():\n    return 0\n")
     (root / "pyproject.toml").write_bytes(_sdist_pyproject())
@@ -40,6 +42,8 @@ def _core_metadata(
         "Metadata-Version: 2.4\n"
         f"Name: {NAME}\n"
         f"Version: {version}\n"
+        "License-Expression: MIT\n"
+        "License-File: LICENSE\n"
         + "".join(f"{header}\n" for header in extra_headers)
         + "\n"
     ).encode()
@@ -51,6 +55,7 @@ def _sdist_pyproject(version: str = VERSION) -> bytes:
         f'name = "{NAME}"\n'
         f'version = "{version}"\n'
         'readme = "README.md"\n'
+        'license = "MIT"\n'
         "\n"
         "[project.scripts]\n"
         'emiya = "emiya_agent.cli:main"\n'
@@ -78,6 +83,7 @@ def _write_wheel(
         f"{DIST_INFO}/WHEEL": (
             b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
         ),
+        f"{DIST_INFO}/licenses/LICENSE": LICENSE_TEXT,
     }
     members.update(extra_members or {})
     record_name = f"{DIST_INFO}/RECORD"
@@ -123,6 +129,7 @@ def _write_sdist(
         f"{ROOT_NAME}/emiya_agent/cli.py": b"def main():\n    return 0\n",
         f"{ROOT_NAME}/PKG-INFO": _core_metadata(),
         f"{ROOT_NAME}/README.md": b"# fixture\n",
+        f"{ROOT_NAME}/LICENSE": LICENSE_TEXT,
     }
     members.update(extra_members or {})
     for member_name in omit_members or set():
@@ -158,6 +165,46 @@ def test_valid_release_with_dist_placeholder_passes(tmp_path: Path) -> None:
     assert metadata.name == NAME
     assert metadata.version == VERSION
     assert metadata.scripts == {"emiya": "emiya_agent.cli:main"}
+    assert metadata.license_expression == "MIT"
+
+
+def test_project_requires_mit_license_metadata(tmp_path: Path) -> None:
+    project, dist = _build_valid_release(tmp_path)
+    pyproject = project / "pyproject.toml"
+    pyproject.write_bytes(pyproject.read_bytes().replace(b'license = "MIT"\n', b""))
+
+    with pytest.raises(ArtifactValidationError, match="MIT license expression"):
+        verify_release_artifacts(dist, project_root=project)
+
+
+def test_wheel_rejects_license_content_drift(tmp_path: Path) -> None:
+    project, dist = _build_valid_release(tmp_path)
+    _write_wheel(
+        dist,
+        extra_members={f"{DIST_INFO}/licenses/LICENSE": b"not the source license\n"},
+    )
+
+    with pytest.raises(ArtifactValidationError, match="license file does not match"):
+        verify_release_artifacts(dist, project_root=project)
+
+
+def test_wheel_rejects_incorrect_license_expression(tmp_path: Path) -> None:
+    project, dist = _build_valid_release(tmp_path)
+    _write_wheel(
+        dist,
+        extra_metadata_headers=("License-Expression: Apache-2.0",),
+    )
+
+    with pytest.raises(ArtifactValidationError, match="License-Expression"):
+        verify_release_artifacts(dist, project_root=project)
+
+
+def test_sdist_requires_license_file(tmp_path: Path) -> None:
+    project, dist = _build_valid_release(tmp_path)
+    _write_sdist(dist, omit_members={f"{ROOT_NAME}/LICENSE"})
+
+    with pytest.raises(ArtifactValidationError, match="missing package or project"):
+        verify_release_artifacts(dist, project_root=project)
 
 
 def test_wheel_rejects_malicious_member_paths(tmp_path: Path) -> None:

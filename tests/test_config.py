@@ -122,6 +122,29 @@ def test_invalid_approval_value_fails_closed(tmp_path: Path):
         load_config(tmp_path)
 
 
+def test_config_validation_error_never_echoes_input_value_or_secret(
+    tmp_path: Path,
+) -> None:
+    secret = "CONFIG-VALIDATION-CANARY-9f7d"
+    secret_provider = "PROVIDER-NAME-CANARY-71ac"
+    path = user_config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        f'[providers."{secret_provider}"]\napi_key_env = {{ secret = "{secret}" }}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        load_config(tmp_path)
+
+    rendered = str(caught.value)
+    assert "配置值校验失败" in rendered
+    assert "providers" in rendered
+    assert secret not in rendered
+    assert secret_provider not in rendered
+    assert "input_value" not in rendered
+
+
 def test_user_hook_configuration_is_validated_and_loaded(tmp_path: Path):
     path = user_config_path()
     path.parent.mkdir(parents=True)
@@ -251,19 +274,39 @@ def test_broken_config_file_does_not_block_startup(tmp_path: Path):
     assert "已被忽略" in cfg.load_warnings[0]
 
 
+def test_broken_config_warning_does_not_echo_parser_input(tmp_path: Path) -> None:
+    secret = "TOML-PARSER-CANARY-4c31"
+    d = tmp_path / ".emiyacode"
+    d.mkdir()
+    (d / "config.toml").write_text(
+        f'unterminated = "{secret}\n',
+        encoding="utf-8",
+    )
+
+    cfg = load_config(tmp_path)
+
+    rendered = "\n".join(cfg.load_warnings)
+    assert "配置文件解析失败" in rendered
+    assert secret not in rendered
+
+
 def test_usage_tracker_last_for_route(tmp_path: Path):
-    """压缩触发必须用执行器自己的 usage，不被其他角色的调用覆盖。"""
+    """同一路由的子 Agent usage 也不能覆盖执行器的压缩样本。"""
     from emiya_agent.agent.usage import UsageTracker
     from emiya_agent.types import Usage
 
     tracker = UsageTracker(load_config(tmp_path))
-    tracker.add("anthropic/claude-fable-5", Usage(input_tokens=800_000))
-    tracker.add("deepseek/deepseek-chat", Usage(input_tokens=500))  # 翻译 Agent 调用
+    route = "anthropic/claude-fable-5"
+    tracker.add(route, Usage(input_tokens=800_000))
+    tracker.add(
+        route,
+        Usage(input_tokens=500),
+        scope="internal:translator",
+    )
 
-    # 全局 last_usage 已被翻译调用覆盖……
-    assert tracker.last_usage.input_tokens == 500
-    # ……但执行器路由的 last_for 仍是自己的
-    assert tracker.last_for("anthropic/claude-fable-5").input_tokens == 800_000
+    assert tracker.last_usage.input_tokens == 800_000
+    assert tracker.last_for(route).input_tokens == 800_000
+    assert tracker.last_for(route, scope="internal:translator").input_tokens == 500
     assert tracker.last_for("never-used/route").input_tokens == 0
 
 

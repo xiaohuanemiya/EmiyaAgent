@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 
 import pytest
 
 from conftest import FakeProvider, assistant_turn
+from emiya_agent.agent.subagent import SubagentSpawner
+from emiya_agent.agent.usage import UsageTracker
 from emiya_agent.config import Config
+from emiya_agent.errors import ProviderError
 from emiya_agent.hooks import (
     DECISION_EVENTS,
     HookCommandConfig,
     HookEvent,
 )
 from emiya_agent.types import TextBlock, user_message
+from emiya_agent.tools.base import ToolContext
+from emiya_agent.tools.registry import ToolRegistry
 from emiya_agent.ui.render import QuietRenderer
 from emiya_agent.ui.repl import Repl
 
@@ -48,6 +54,14 @@ class _Lookup:
 
     def get(self, route: str):
         return self.provider, "model"
+
+
+class _FailingProvider(FakeProvider):
+    async def stream(self, req):
+        self.requests.append(req)
+        if False:  # pragma: no cover - keep this an async generator
+            yield None
+        raise ProviderError("provider failed")
 
 
 def _repl(tmp_path, hooks: list[HookCommandConfig], provider: FakeProvider) -> Repl:
@@ -153,6 +167,24 @@ async def test_stop_hook_observes_stop_reason(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_hook_observes_provider_failure(tmp_path) -> None:
+    marker = tmp_path / "stop-provider-error.json"
+    provider = _FailingProvider([])
+    repl = _repl(
+        tmp_path,
+        [_hook(HookEvent.STOP, MARKER_SOURCE, str(marker))],
+        provider,
+    )
+
+    result = await repl._execute_turn("trigger provider failure")
+
+    assert result is None
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["tool_name"] == "provider_error"
+    assert payload["payload"]["stop_reason"] == "provider_error"
+
+
+@pytest.mark.asyncio
 async def test_pre_compact_deny_skips_compaction(tmp_path) -> None:
     provider = FakeProvider([])
     repl = _repl(
@@ -188,6 +220,73 @@ async def test_one_shot_fires_session_start_and_end(tmp_path) -> None:
     end_payload = json.loads(end_marker.read_text(encoding="utf-8"))
     assert end_payload["event"] == "SessionEnd"
     assert end_payload["payload"]["reason"] == "exit"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_start_still_cleans_up(tmp_path, monkeypatch) -> None:
+    repl = _repl(tmp_path, [], FakeProvider([]))
+    calls: list[str] = []
+
+    async def connect() -> None:
+        calls.append("connect")
+
+    async def emit(event, subject, payload=None):
+        del subject, payload
+        calls.append(event.value)
+        if event is HookEvent.SESSION_START:
+            raise asyncio.CancelledError
+        return None
+
+    async def record(name: str) -> None:
+        calls.append(name)
+
+    monkeypatch.setattr(repl, "_connect_mcp", connect)
+    monkeypatch.setattr(repl, "emit_hook_event", emit)
+    monkeypatch.setattr(repl.task_service, "shutdown", lambda: record("tasks"))
+    monkeypatch.setattr(repl.lsp, "close_all", lambda: record("lsp"))
+    monkeypatch.setattr(repl.mcp, "stop_all", lambda: record("mcp"))
+    monkeypatch.setattr(repl, "_release_store_writer", lambda: calls.append("store"))
+
+    with pytest.raises(asyncio.CancelledError):
+        await repl.run()
+
+    assert calls == [
+        "connect",
+        "SessionStart",
+        "SessionEnd",
+        "tasks",
+        "lsp",
+        "mcp",
+        "store",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_subagent_stop_hook_observes_cancellation(tmp_path) -> None:
+    marker = tmp_path / "subagent-stop-cancelled.json"
+    provider = FakeProvider([assistant_turn([], stop_reason="interrupted")])
+    config = Config(
+        cwd=tmp_path,
+        routes={"subagent_explore": "fake/model"},
+        hooks=[_hook(HookEvent.SUBAGENT_STOP, MARKER_SOURCE, str(marker))],
+    )
+    spawner = SubagentSpawner(
+        _Lookup(provider),
+        config,
+        ToolRegistry(),
+        QuietRenderer(),
+        UsageTracker(config),
+    )
+    cancel = asyncio.Event()
+    cancel.set()
+    ctx = ToolContext(cwd=tmp_path, config=config, ui=object(), cancel=cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await spawner.spawn("explore", "stop now", ctx, quiet=True)
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["event"] == "SubagentStop"
+    assert payload["payload"]["stop_reason"] == "cancelled"
 
 
 @pytest.mark.asyncio

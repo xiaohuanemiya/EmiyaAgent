@@ -20,7 +20,9 @@ from emiya_agent.session.store import (
     validate_checkpoint_name,
 )
 from emiya_agent.types import (
+    FallbackBlock,
     Message,
+    RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -78,6 +80,75 @@ def test_roundtrip(tmp_path):
 
     loaded = SessionStore.load_messages(path)
     assert loaded == original  # pydantic 等值 → 完整往返
+
+
+def test_redacted_thinking_survives_session_roundtrip_and_repair(tmp_path):
+    path = tmp_path / "redacted.jsonl"
+    store = SessionStore(path)
+    assistant = Message(
+        role="assistant",
+        content=[
+            RedactedThinkingBlock(data="opaque-encrypted-blob"),
+            ToolUseBlock(id="t1", name="read_file", input={"path": "a.py"}),
+        ],
+    )
+    result = Message(
+        role="user",
+        content=[ToolResultBlock(tool_use_id="t1", content="data")],
+    )
+    store.append_message(assistant)
+    store.append_message(result)
+
+    loaded = SessionStore.load_messages(path)
+    repaired, changed = repaired_message_copy(loaded, "not executed")
+
+    assert loaded == [assistant, result]
+    assert repaired == loaded
+    assert changed is False
+    assert isinstance(repaired[0].content[0], RedactedThinkingBlock)
+    assert repaired[0].content[0].data == "opaque-encrypted-blob"
+
+
+def test_fallback_boundary_survives_session_roundtrip_and_repair(tmp_path):
+    path = tmp_path / "fallback.jsonl"
+    store = SessionStore(path)
+    boundary = FallbackBlock(
+        data={
+            "from": {"model": "claude-fable-5"},
+            "to": {"model": "claude-opus-4-8"},
+            "trigger": {"type": "refusal", "category": "cyber"},
+        },
+        source="anthropic:official",
+    )
+    assistant = Message(
+        role="assistant",
+        content=[
+            TextBlock(text="partial"),
+            boundary,
+            ThinkingBlock(
+                thinking="fallback reasoning",
+                signature="fallback-sig",
+                source="anthropic:official",
+            ),
+            ToolUseBlock(id="t1", name="read_file", input={"path": "a.py"}),
+        ],
+    )
+    result = Message(
+        role="user",
+        content=[ToolResultBlock(tool_use_id="t1", content="data")],
+    )
+    store.append_message(assistant)
+    store.append_message(result)
+
+    loaded = SessionStore.load_messages(path)
+    repaired, changed = repaired_message_copy(loaded, "not executed")
+
+    assert loaded == [assistant, result]
+    assert repaired == loaded
+    assert changed is False
+    restored = repaired[0].content[1]
+    assert isinstance(restored, FallbackBlock)
+    assert restored == boundary
 
 
 def test_meta_lines_skipped_on_load(tmp_path):

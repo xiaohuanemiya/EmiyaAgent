@@ -4,6 +4,11 @@
 根据任务复杂度和独立性，自主决定直接回答、使用工具，或按需派生 `explore`、
 `plan`、`general` 子 Agent。输入语言不参与是否规划的判断。
 
+`executor` 是唯一持有顶层会话和编排权的根 Agent。除它之外，核心生成式调用都通过
+隔离的子 Agent 循环执行：`explore`、`plan`、`general` 是可委派角色，translator 与
+compactor 是宿主内部使用的无工具、单轮专用角色，不能通过公共 `spawn_subagent` 调用。
+工具、MCP、LSP、Hook 和 provider 协议传输属于基础设施调用，不是模型角色或子 Agent。
+
 跨语言交接由主 Agent 按收益调用 `translate_for_model`。该工具从下一角色当前的
 模型路由解析目标语言，再调用 translator Agent 做等价适配；调用方不能自报目标语言。
 短文本、同语言或代码为主的交接不必翻译，也不存在固定的“翻译后再 plan”流程。
@@ -12,12 +17,12 @@
 功能一览：
 
 - **自主任务编排**：问候、简单问答和清晰的一步任务直接处理；只有复杂、高风险、跨模块或可独立并行的工作才按收益选择子 Agent，不执行固定的 explore → plan → general 流程
-- **模型语言感知翻译**：`translate_for_model` 动态读取 executor/explore/plan/general 的下一跳模型与主要语言，仅在复杂或精度敏感的跨语言交接中调用 translator Agent；只翻译，不规划、不扩写
+- **模型语言感知翻译**：`translate_for_model` 动态读取 executor/explore/plan/general 的下一跳模型与主要语言，仅在复杂或精度敏感的跨语言交接中调用内部 translator 子 Agent；该角色无工具且只运行一轮，只翻译，不规划、不扩写
 - **Agent 工具循环**：shell（PowerShell）、文件读写/精确编辑、glob/grep 搜索、todo 进度、中途提问；并行工具调用；Ctrl+C 干净中断
-- **多智能体**：`spawn_subagent` 派生隔离上下文的子 agent —— explore（只读搜索）/ plan（只读设计）/ general（完整工具）；支持有界后台队列、独立取消与 Git worktree 隔离
+- **多智能体**：`spawn_subagent` 只公开 explore（只读搜索）/ plan（只读设计）/ general（完整工具）三类隔离子 Agent；translator/compactor 仅由宿主内部调用；支持有界后台队列、独立取消与 Git worktree 隔离
 - **Skills**：`.emiyacode/skills/<名>/SKILL.md`（用户级+项目级），描述进系统提示词，内容按需加载
 - **项目记忆**：`.emiyacode/memory/`（MEMORY.md 索引 + 一事一文件），跨会话持久
-- **上下文压缩**：超过执行模型窗口 70% 自动用 DeepSeek 摘要旧轮次；`/compact` 手动触发
+- **上下文压缩**：超过执行模型窗口 70% 后，由隔离、无工具、单轮的 compactor 子 Agent 摘要旧轮次；`/compact` 手动触发
 - **MCP 接入**：stdio / streamable-HTTP 服务器，工具以 `mcp__服务器__工具` 注册
 - **策略 Hook**：有界命令钩子覆盖工具与生命周期事件（`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`/`Stop`/`SubagentStop`/`PreCompact`/`PostCompact`），决策型事件可提升审批或阻断，子 agent 同样生效
 - **LSP 语义导航**：按需连接本地 language server，提供诊断、定义、引用、悬停和符号查询
@@ -52,12 +57,15 @@ $env:DEEPSEEK_API_KEY = "sk-..."     # 方式一：环境变量
 
 | 角色 | 职责 | 默认路由 |
 |---|---|---|
-| `executor` | 主执行 agent（工具循环） | `anthropic/claude-fable-5` |
-| `translator` | 下一跳模型语言适配 | `deepseek/deepseek-chat` |
-| `compactor` | 上下文压缩摘要 | `deepseek/deepseek-chat` |
-| `subagent_explore` | 只读搜索子 agent | `deepseek/deepseek-chat` |
-| `subagent_plan` | 方案设计子 agent | `anthropic/claude-opus-4-8` |
-| `subagent_general` | 通用执行子 agent | `anthropic/claude-opus-4-8` |
+| `executor` | 唯一根 Agent（顶层会话与工具编排） | `anthropic/claude-fable-5` |
+| `translator` | 内部无工具单轮子 Agent：下一跳语言适配 | `deepseek/deepseek-chat` |
+| `compactor` | 内部无工具单轮子 Agent：上下文压缩摘要 | `deepseek/deepseek-chat` |
+| `subagent_explore` | 可委派的只读搜索子 Agent | `deepseek/deepseek-chat` |
+| `subagent_plan` | 可委派的只读方案设计子 Agent | `anthropic/claude-opus-4-8` |
+| `subagent_general` | 可委派的通用执行子 Agent | `anthropic/claude-opus-4-8` |
+
+表中的六项都是独立模型路由，但只有后三项是 `spawn_subagent` 的公共角色；translator
+由 `translate_for_model` 调用，compactor 由上下文压缩器调用。
 
 运行时切换：`/route`（列出全部）、`/route translator glm/glm-4.6`、
 `/route executor openai/gpt-5.6`；`/model` 是 `/route executor` 的快捷方式。
@@ -373,8 +381,6 @@ GitHub Actions 会在 Windows、Ubuntu、macOS，以及 Python 3.12/3.13/3.14 �
 [安全政策](SECURITY.md)、[对标分析](docs/COMPARISON.md)、[路线图](docs/ROADMAP.md) 和
 [变更日志](CHANGELOG.md)；项目级 agent 指令见 [AGENTS.md](AGENTS.md)。
 
-## 开源发布状态
+## 许可证
 
-仓库目前尚未选择 `LICENSE`，因此不应被假定为允许复制、修改或再分发的开源发行版。
-许可证是维护者的法律与治理选择，不能由自动化代选；完成 SPDX 许可证选择仍是
-[路线图](docs/ROADMAP.md) 中的公开发布阻断项。
+EmiyaAgent 采用 [MIT License](LICENSE)。

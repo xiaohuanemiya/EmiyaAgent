@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, ClassVar
 
 import pytest
@@ -155,6 +156,46 @@ async def test_plain_answer_no_tools(tmp_path, config, quiet_console):
 
 
 @pytest.mark.asyncio
+async def test_external_task_cancel_during_stream_propagates(
+    tmp_path, config, quiet_console
+):
+    stream_started = asyncio.Event()
+    stream_release = asyncio.Event()
+    stream_finished = asyncio.Event()
+
+    class BlockingProvider(FakeProvider):
+        async def stream(self, req):
+            self.requests.append(req)
+            stream_started.set()
+            try:
+                await stream_release.wait()
+            finally:
+                stream_finished.set()
+            yield assistant_turn([TextBlock(text="too late")])
+
+    loop = make_loop(BlockingProvider([]), make_registry(), quiet_console)
+    loop_task = asyncio.create_task(
+        loop.run(
+            [user_message("hello")],
+            system="s",
+            ctx=make_ctx(tmp_path, config),
+        )
+    )
+
+    try:
+        await asyncio.wait_for(stream_started.wait(), timeout=1)
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(loop_task, timeout=1)
+        assert stream_finished.is_set()
+    finally:
+        stream_release.set()
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_tool_roundtrip_pairing(tmp_path, config, quiet_console):
     provider = FakeProvider(
         [
@@ -264,6 +305,395 @@ async def test_cancel_mid_batch_synthesizes_remaining(tmp_path, config, quiet_co
     by_id = {r.tool_use_id: r for r in results}
     assert by_id["t1"].content == "done, then cancelled"
     assert by_id["t2"].is_error and INTERRUPTED_NOTE in by_id["t2"].content
+
+
+@pytest.mark.asyncio
+async def test_parallel_self_cancel_settles_sibling_before_pairing(
+    tmp_path, config, quiet_console
+):
+    sibling_started = asyncio.Event()
+    sibling_release = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    sibling_finished = asyncio.Event()
+
+    class SelfCancellingReadTool(Tool):
+        name: ClassVar[str] = "self_cancel_read"
+        description: ClassVar[str] = "cancels itself after its sibling starts"
+        input_schema: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+        read_only: ClassVar[bool] = True
+
+        async def run(self, args, ctx):
+            await sibling_started.wait()
+            raise asyncio.CancelledError
+
+    class BlockingReadTool(Tool):
+        name: ClassVar[str] = "blocking_read"
+        description: ClassVar[str] = "blocks until cancelled"
+        input_schema: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+        read_only: ClassVar[bool] = True
+
+        async def run(self, args, ctx):
+            sibling_started.set()
+            try:
+                await sibling_release.wait()
+                return ToolResult(content="released without cancellation")
+            finally:
+                cleanup_started.set()
+                await cleanup_release.wait()
+                sibling_finished.set()
+
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [
+                    tool_use("t1", "self_cancel_read"),
+                    tool_use("t2", "blocking_read"),
+                ],
+                stop_reason="tool_use",
+            )
+        ]
+    )
+    loop = make_loop(
+        provider,
+        make_registry(SelfCancellingReadTool(), BlockingReadTool()),
+        quiet_console,
+    )
+    messages = [user_message("go")]
+    loop_task = asyncio.create_task(
+        loop.run(messages, system="s", ctx=make_ctx(tmp_path, config))
+    )
+    cleanup_wait = asyncio.create_task(cleanup_started.wait())
+
+    try:
+        await asyncio.wait_for(sibling_started.wait(), timeout=1)
+        done, _ = await asyncio.wait_for(
+            asyncio.wait(
+                {loop_task, cleanup_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            ),
+            timeout=1,
+        )
+        assert cleanup_wait in done
+        assert not loop_task.done(), (
+            "AgentLoop returned before the cancelled sibling finished cleanup"
+        )
+
+        cleanup_release.set()
+        result = await asyncio.wait_for(loop_task, timeout=1)
+
+        assert result.stop_reason == "interrupted"
+        assert sibling_finished.is_set()
+        results = [
+            block
+            for block in messages[-1].content
+            if isinstance(block, ToolResultBlock)
+        ]
+        assert [block.tool_use_id for block in results] == ["t1", "t2"]
+        assert all(
+            block.is_error and block.content == INTERRUPTED_NOTE for block in results
+        )
+    finally:
+        sibling_release.set()
+        cleanup_release.set()
+        await asyncio.wait_for(sibling_finished.wait(), timeout=1)
+        if not cleanup_wait.done():
+            cleanup_wait.cancel()
+        await asyncio.gather(cleanup_wait, return_exceptions=True)
+        if not loop_task.done():
+            await asyncio.wait_for(loop_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_external_task_cancel_pairs_results_after_parallel_cleanup(
+    tmp_path, config, quiet_console
+):
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    dispatch_release = asyncio.Event()
+    first_cleanup_started = asyncio.Event()
+    second_cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    first_finished = asyncio.Event()
+    second_finished = asyncio.Event()
+
+    async def block_until_cancelled(started, cleanup_started, finished):
+        started.set()
+        try:
+            await dispatch_release.wait()
+            return ToolResult(content="released without cancellation")
+        finally:
+            cleanup_started.set()
+            await cleanup_release.wait()
+            finished.set()
+
+    class FirstBlockingReadTool(Tool):
+        name: ClassVar[str] = "first_blocking_read"
+        description: ClassVar[str] = "first blocking read"
+        input_schema: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+        read_only: ClassVar[bool] = True
+
+        async def run(self, args, ctx):
+            return await block_until_cancelled(
+                first_started, first_cleanup_started, first_finished
+            )
+
+    class SecondBlockingReadTool(Tool):
+        name: ClassVar[str] = "second_blocking_read"
+        description: ClassVar[str] = "second blocking read"
+        input_schema: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+        read_only: ClassVar[bool] = True
+
+        async def run(self, args, ctx):
+            return await block_until_cancelled(
+                second_started, second_cleanup_started, second_finished
+            )
+
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [
+                    tool_use("t1", "first_blocking_read"),
+                    tool_use("t2", "second_blocking_read"),
+                ],
+                stop_reason="tool_use",
+            )
+        ]
+    )
+    loop = make_loop(
+        provider,
+        make_registry(FirstBlockingReadTool(), SecondBlockingReadTool()),
+        quiet_console,
+    )
+    messages = [user_message("go")]
+    loop_task = asyncio.create_task(
+        loop.run(messages, system="s", ctx=make_ctx(tmp_path, config))
+    )
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(first_started.wait(), second_started.wait()),
+            timeout=1,
+        )
+        loop_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(
+                first_cleanup_started.wait(), second_cleanup_started.wait()
+            ),
+            timeout=1,
+        )
+        assert not loop_task.done(), (
+            "AgentLoop exposed cancellation before parallel cleanup completed"
+        )
+
+        cleanup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(loop_task, timeout=1)
+
+        assert first_finished.is_set() and second_finished.is_set()
+        results = [
+            block
+            for block in messages[-1].content
+            if isinstance(block, ToolResultBlock)
+        ]
+        assert [block.tool_use_id for block in results] == ["t1", "t2"]
+        assert all(
+            block.is_error and block.content == INTERRUPTED_NOTE for block in results
+        )
+    finally:
+        dispatch_release.set()
+        cleanup_release.set()
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_parallel_cleanup_escalates_after_first_cancel_is_swallowed(
+    tmp_path, config, quiet_console, monkeypatch
+):
+    import emiya_agent.agent.loop as loop_module
+
+    first_cancel_seen = asyncio.Event()
+    finished = asyncio.Event()
+
+    class CancellationResistantReadTool(Tool):
+        name: ClassVar[str] = "cancellation_resistant_read"
+        description: ClassVar[str] = "requires a second cancellation"
+        input_schema: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+        read_only: ClassVar[bool] = True
+
+        async def run(self, args, ctx):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                first_cancel_seen.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    finished.set()
+
+    class SelfCancellingReadTool(Tool):
+        name: ClassVar[str] = "trigger_parallel_cancel"
+        description: ClassVar[str] = "cancels its own child task"
+        input_schema: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+        read_only: ClassVar[bool] = True
+
+        async def run(self, args, ctx):
+            await asyncio.sleep(0)
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(loop_module, "PARALLEL_CANCEL_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(loop_module, "PARALLEL_CANCEL_FORCE_SECONDS", 0.2)
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [
+                    tool_use("t1", "cancellation_resistant_read"),
+                    tool_use("t2", "trigger_parallel_cancel"),
+                ],
+                stop_reason="tool_use",
+            )
+        ]
+    )
+    messages = [user_message("go")]
+    loop = make_loop(
+        provider,
+        make_registry(CancellationResistantReadTool(), SelfCancellingReadTool()),
+        quiet_console,
+    )
+
+    result = await asyncio.wait_for(
+        loop.run(messages, system="s", ctx=make_ctx(tmp_path, config)),
+        timeout=1,
+    )
+
+    assert result.stop_reason == "interrupted"
+    assert first_cancel_seen.is_set()
+    assert finished.is_set()
+    results = [
+        block for block in messages[-1].content if isinstance(block, ToolResultBlock)
+    ]
+    assert [block.tool_use_id for block in results] == ["t1", "t2"]
+    assert all(block.is_error for block in results)
+
+
+@pytest.mark.asyncio
+async def test_parallel_cleanup_deadline_still_pairs_before_detached_task_exits(
+    tmp_path, config, quiet_console, monkeypatch
+):
+    import emiya_agent.agent.loop as loop_module
+
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release = asyncio.Event()
+    first_finished = asyncio.Event()
+    second_finished = asyncio.Event()
+
+    async def stubborn(started, finished):
+        started.set()
+        try:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            return ToolResult(content="released")
+        finally:
+            finished.set()
+
+    class FirstStubbornReadTool(Tool):
+        name: ClassVar[str] = "first_stubborn_read"
+        description: ClassVar[str] = "first cancellation-resistant read"
+        input_schema: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+        read_only: ClassVar[bool] = True
+
+        async def run(self, args, ctx):
+            return await stubborn(first_started, first_finished)
+
+    class SecondStubbornReadTool(Tool):
+        name: ClassVar[str] = "second_stubborn_read"
+        description: ClassVar[str] = "second cancellation-resistant read"
+        input_schema: ClassVar[dict[str, Any]] = {
+            "type": "object",
+            "properties": {},
+        }
+        read_only: ClassVar[bool] = True
+
+        async def run(self, args, ctx):
+            return await stubborn(second_started, second_finished)
+
+    monkeypatch.setattr(loop_module, "PARALLEL_CANCEL_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(loop_module, "PARALLEL_CANCEL_FORCE_SECONDS", 0.01)
+    provider = FakeProvider(
+        [
+            assistant_turn(
+                [
+                    tool_use("t1", "first_stubborn_read"),
+                    tool_use("t2", "second_stubborn_read"),
+                ],
+                stop_reason="tool_use",
+            )
+        ]
+    )
+    messages = [user_message("go")]
+    loop = make_loop(
+        provider,
+        make_registry(FirstStubbornReadTool(), SecondStubbornReadTool()),
+        quiet_console,
+    )
+    loop_task = asyncio.create_task(
+        loop.run(messages, system="s", ctx=make_ctx(tmp_path, config))
+    )
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(first_started.wait(), second_started.wait()),
+            timeout=1,
+        )
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(loop_task, timeout=1)
+
+        assert not first_finished.is_set()
+        assert not second_finished.is_set()
+        results = [
+            block
+            for block in messages[-1].content
+            if isinstance(block, ToolResultBlock)
+        ]
+        assert [block.tool_use_id for block in results] == ["t1", "t2"]
+        assert all(block.is_error for block in results)
+    finally:
+        release.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_finished.wait(), second_finished.wait()),
+            timeout=1,
+        )
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

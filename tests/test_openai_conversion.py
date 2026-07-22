@@ -3,14 +3,20 @@
 import json
 from types import SimpleNamespace as NS
 
+import pytest
+
 from emiya_agent.providers.base import ChatRequest, MessageDone, ToolSpec
 from emiya_agent.providers.openai_compat import (
     ChunkAggregator,
+    OpenAICompatProvider,
+    openai_endpoint_identity,
     to_openai_messages,
     to_openai_tools,
 )
 from emiya_agent.types import (
+    FallbackBlock,
     Message,
+    RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -71,10 +77,121 @@ def test_tool_results_become_tool_role_messages_before_user_text():
 def test_thinking_blocks_dropped_on_send():
     assistant = Message(
         role="assistant",
-        content=[ThinkingBlock(thinking="hmm", signature="sig"), TextBlock(text="ok")],
+        content=[
+            ThinkingBlock(thinking="hmm", signature="sig"),
+            RedactedThinkingBlock(data="opaque"),
+            FallbackBlock(data={"to": {"model": "fallback"}}),
+            TextBlock(text="ok"),
+        ],
     )
     (msg,) = to_openai_messages(_req([assistant], system=""))
     assert msg == {"role": "assistant", "content": "ok"}
+
+
+def test_deepseek_tool_call_replays_unsigned_reasoning_content_only():
+    assistant = Message(
+        role="assistant",
+        content=[
+            ThinkingBlock(
+                thinking="deepseek reasoning",
+                source=openai_endpoint_identity(
+                    "deepseek", "https://api.deepseek.com"
+                ),
+            ),
+            ThinkingBlock(thinking="anthropic reasoning", signature="sig"),
+            ThinkingBlock(
+                thinking="other provider reasoning",
+                source=openai_endpoint_identity("glm", "https://glm.example.test"),
+            ),
+            ToolUseBlock(id="call-1", name="read", input={"path": "a.py"}),
+        ],
+    )
+    result = Message(
+        role="user",
+        content=[ToolResultBlock(tool_use_id="call-1", content="file contents")],
+    )
+
+    msg, tool_result = to_openai_messages(
+        _req([assistant, result], system=""), replay_tool_reasoning=True
+    )
+
+    assert msg["reasoning_content"] == "deepseek reasoning"
+    assert msg["content"] == ""
+    assert msg["tool_calls"][0]["id"] == "call-1"
+    assert tool_result == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "file contents",
+    }
+
+
+def test_deepseek_does_not_replay_reasoning_without_tool_call():
+    assistant = Message(
+        role="assistant",
+        content=[ThinkingBlock(thinking="past reasoning"), TextBlock(text="answer")],
+    )
+
+    (msg,) = to_openai_messages(
+        _req([assistant], system=""), replay_tool_reasoning=True
+    )
+
+    assert msg == {"role": "assistant", "content": "answer"}
+
+
+def test_deepseek_does_not_replay_reasoning_without_provenance():
+    assistant = Message(
+        role="assistant",
+        content=[
+            ThinkingBlock(thinking="unknown origin"),
+            ToolUseBlock(id="call-1", name="read", input={}),
+        ],
+    )
+
+    (msg,) = to_openai_messages(
+        _req([assistant], system=""), replay_tool_reasoning=True
+    )
+
+    assert msg["content"] == ""
+    assert "reasoning_content" not in msg
+
+
+def test_deepseek_reasoning_never_crosses_base_url_change():
+    old_source = openai_endpoint_identity(
+        "deepseek", "https://old.deepseek.example/v1"
+    )
+    new_source = openai_endpoint_identity(
+        "deepseek", "https://new.deepseek.example/v1"
+    )
+    assistant = Message(
+        role="assistant",
+        content=[
+            ThinkingBlock(thinking="endpoint-private", source=old_source),
+            ToolUseBlock(id="call-1", name="read", input={}),
+        ],
+    )
+
+    (msg,) = to_openai_messages(
+        _req([assistant], system=""),
+        replay_tool_reasoning=True,
+        reasoning_source=new_source,
+    )
+
+    assert msg["content"] == ""
+    assert "reasoning_content" not in msg
+
+
+@pytest.mark.asyncio
+async def test_provider_identity_uses_effective_openai_environment_url(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.example/openai/v1")
+    provider = OpenAICompatProvider(name="deepseek", api_key="test-key")
+    try:
+        effective = str(provider._client.base_url)
+        assert "proxy.example" in effective
+        assert provider._endpoint_identity == openai_endpoint_identity(
+            "deepseek", effective
+        )
+    finally:
+        await provider._client.close()
 
 
 def test_reasoning_effort_mapping():
@@ -126,6 +243,58 @@ def _tool_delta(index, id=None, name=None, arguments=None):
         reasoning_content=None,
         tool_calls=[NS(index=index, id=id, function=NS(name=name, arguments=arguments))],
     )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_replays_complete_tool_assistant_kwargs(monkeypatch):
+    provider = OpenAICompatProvider(
+        name="deepseek", api_key="test-key", base_url="https://api.deepseek.test"
+    )
+    captured: dict = {}
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+
+        async def chunks():
+            yield _chunk(finish_reason="stop")
+
+        return chunks()
+
+    monkeypatch.setattr(provider._client.chat.completions, "create", fake_create)
+    assistant = Message(
+        role="assistant",
+        content=[
+            ThinkingBlock(
+                thinking="continued reasoning",
+                source=provider._endpoint_identity,
+            ),
+            ToolUseBlock(id="call-1", name="read", input={"path": "a.py"}),
+        ],
+    )
+    result = Message(
+        role="user",
+        content=[ToolResultBlock(tool_use_id="call-1", content="file contents")],
+    )
+
+    try:
+        events = [
+            event
+            async for event in provider.stream(
+                ChatRequest(
+                    model="deepseek-v4-pro",
+                    system="",
+                    messages=[assistant, result],
+                )
+            )
+        ]
+    finally:
+        await provider._client.close()
+
+    assert isinstance(events[-1], MessageDone)
+    replayed = captured["messages"][0]
+    assert replayed["content"] == ""
+    assert replayed["reasoning_content"] == "continued reasoning"
+    assert replayed["tool_calls"][0]["id"] == "call-1"
 
 
 def test_aggregate_text_stream():

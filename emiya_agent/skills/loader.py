@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +19,7 @@ from pathlib import Path
 import yaml
 
 from emiya_agent.config import CONFIG_DIR_NAME, Config
+from emiya_agent.safe_paths import UnsafePathError, confined_path, open_confined
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
@@ -26,29 +29,101 @@ class Skill:
     name: str
     description: str
     path: Path  # SKILL.md 所在路径
+    root: Path  # 发现时声明的技能根目录（保留词法路径以检测后续替换）
+    resolved_root: Path  # 发现时的规范根目录身份
+    root_identity: tuple[int, int]
+    content_digest: bytes
+
+    def _relative_path(self, path: Path) -> Path:
+        """Revalidate the discovery root and return a confined relative path."""
+
+        try:
+            root_stat = self.root.stat()
+            if (
+                self.root.resolve(strict=True) != self.resolved_root
+                or (root_stat.st_dev, root_stat.st_ino) != self.root_identity
+            ):
+                raise UnsafePathError("技能根目录在发现后发生变化")
+            relative = path.absolute().relative_to(self.root.absolute())
+            path.resolve(strict=True).relative_to(self.resolved_root)
+        except (OSError, ValueError) as exc:
+            raise UnsafePathError(f"技能路径在发现后越界或失效: {path}") from exc
+        # confined_path rejects any link/reparse component, including a final
+        # SKILL.md swapped after discovery. open_confined adds O_NOFOLLOW on POSIX.
+        confined_path(self.root, relative, label="技能文件")
+        return relative
 
     def content(self) -> str:
-        return self.path.read_text(encoding="utf-8")
+        relative = self._relative_path(self.path)
+        with open_confined(
+            self.root,
+            relative,
+            "r",
+            label="技能文件",
+            encoding="utf-8",
+        ) as stream:
+            content = stream.read()
+        if hashlib.sha256(content.encode("utf-8")).digest() != self.content_digest:
+            raise UnsafePathError("技能文件内容在发现后发生变化")
+        return content
 
     def bundled_files(self) -> list[Path]:
         """技能目录中除 SKILL.md 外的文件。"""
-        return [
-            p
-            for p in sorted(self.path.parent.rglob("*"))
-            if p.is_file() and p.name != "SKILL.md"
-        ]
+        skill_dir = self.root / self._relative_path(self.path.parent)
+        files: list[Path] = []
+        for path in sorted(skill_dir.rglob("*")):
+            if path.name == "SKILL.md" or not path.is_file():
+                continue
+            try:
+                self._relative_path(path)
+            except UnsafePathError:
+                continue
+            files.append(path)
+        return files
 
 
-def parse_skill_md(path: Path) -> Skill | None:
+def parse_skill_md(path: Path, *, root: Path | None = None) -> Skill | None:
+    declared_root = (root or path.parent).absolute()
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        resolved_root = declared_root.resolve(strict=True)
+        root_stat = declared_root.stat()
+        relative = path.absolute().relative_to(declared_root)
+        candidate = confined_path(declared_root, relative, label="技能文件")
+        candidate.resolve(strict=True).relative_to(resolved_root)
+
+        # Parse only bytes read through the confined handle.  Checking the
+        # opened file identity against the path after the read closes the
+        # classic validate-then-open / swap-then-restore race as well.
+        with open_confined(
+            declared_root,
+            relative,
+            "r",
+            label="技能文件",
+            encoding="utf-8",
+        ) as stream:
+            opened_stat = os.fstat(stream.fileno())
+            text = stream.read()
+            # Keep the handle alive until the comparison finishes so a closed
+            # file identifier cannot be recycled into a false match.
+            current = confined_path(declared_root, relative, label="技能文件")
+            current_stat = current.stat(follow_symlinks=False)
+            current_root_stat = declared_root.stat()
+            if (
+                declared_root.resolve(strict=True) != resolved_root
+                or (current_root_stat.st_dev, current_root_stat.st_ino)
+                != (root_stat.st_dev, root_stat.st_ino)
+                or (current_stat.st_dev, current_stat.st_ino)
+                != (opened_stat.st_dev, opened_stat.st_ino)
+            ):
+                return None
+    except (OSError, UnicodeDecodeError, UnsafePathError, ValueError):
         return None
     match = _FRONTMATTER_RE.match(text)
     meta: dict = {}
     if match:
         try:
-            meta = yaml.safe_load(match.group(1)) or {}
+            loaded = yaml.safe_load(match.group(1))
+            meta = loaded if isinstance(loaded, dict) else {}
         except yaml.YAMLError:
             meta = {}
     name = str(meta.get("name") or path.parent.name).strip()
@@ -60,7 +135,15 @@ def parse_skill_md(path: Path) -> Skill | None:
             if line.strip() and not line.startswith("#"):
                 description = line.strip()[:200]
                 break
-    return Skill(name=name, description=description, path=path)
+    return Skill(
+        name=name,
+        description=description,
+        path=path.absolute(),
+        root=declared_root,
+        resolved_root=resolved_root,
+        root_identity=(root_stat.st_dev, root_stat.st_ino),
+        content_digest=hashlib.sha256(text.encode("utf-8")).digest(),
+    )
 
 
 def discover_skills(dirs: list[Path]) -> dict[str, Skill]:
@@ -80,7 +163,7 @@ def discover_skills(dirs: list[Path]) -> dict[str, Skill]:
                 skill_md.resolve(strict=True).relative_to(resolved_root)
             except (OSError, ValueError):
                 continue
-            skill = parse_skill_md(skill_md)
+            skill = parse_skill_md(skill_md, root=d)
             if skill is not None:
                 skills[skill.name] = skill
     return skills

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable
 
+from emiya_agent.agent.specialist_prompts import COMPACT_SYSTEM
 from emiya_agent.types import (
     Message,
     TextBlock,
@@ -18,18 +19,6 @@ from emiya_agent.types import (
     Usage,
     user_message,
 )
-
-COMPACT_SYSTEM = """\
-You are a conversation compactor for a coding agent. Summarize the transcript \
-into a dense briefing the agent can resume work from. Preserve, in this order:
-1. The task(s) and their current state (done / in progress / blocked)
-2. Decisions made and constraints discovered (with reasons)
-3. Files created/modified/read that still matter (exact paths)
-4. Key facts, values, and identifiers learned from tool output
-5. Open todos and next steps
-Omit pleasantries and dead ends. Output a structured Markdown summary. \
-Answer in the language the conversation mainly uses.
-"""
 
 COMPACT_MARKER = "[COMPACTED HISTORY]"
 

@@ -15,7 +15,9 @@ from emiya_agent.session.store import (
     validate_checkpoint_name,
 )
 from emiya_agent.types import (
+    FallbackBlock,
     Message,
+    RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -69,7 +71,16 @@ def repaired_message_copy(
         assistant_content = [
             block
             for block in message.content
-            if isinstance(block, (TextBlock, ThinkingBlock, ToolUseBlock))
+            if isinstance(
+                block,
+                (
+                    TextBlock,
+                    ThinkingBlock,
+                    RedactedThinkingBlock,
+                    FallbackBlock,
+                    ToolUseBlock,
+                ),
+            )
         ]
         if len(assistant_content) != len(message.content):
             changed = True

@@ -6,7 +6,11 @@ import pytest
 
 from emiya_agent.config import Config
 from emiya_agent.memory.manager import MemoryManager
+from emiya_agent.skills import loader as skill_loader
 from emiya_agent.tools.memory_tool import MemoryTool
+from emiya_agent.tools.base import ToolContext
+from emiya_agent.tools.skill_tool import SkillTool
+from tests.conftest import FakeUI
 from emiya_agent.skills.loader import (
     default_skill_dirs,
     discover_skills,
@@ -38,6 +42,21 @@ def test_parse_without_frontmatter_falls_back(tmp_path):
     skill = parse_skill_md(d / "SKILL.md")
     assert skill.name == "raw"  # 目录名兜底
     assert skill.description == "First meaningful line."
+
+
+def test_non_mapping_frontmatter_falls_back_without_crashing(tmp_path):
+    d = tmp_path / "raw-list"
+    d.mkdir()
+    (d / "SKILL.md").write_text(
+        "---\n- not\n- a mapping\n---\nUseful fallback line.\n",
+        encoding="utf-8",
+    )
+
+    skill = parse_skill_md(d / "SKILL.md")
+
+    assert skill is not None
+    assert skill.name == "raw-list"
+    assert skill.description == "Useful fallback line."
 
 
 def test_project_overrides_user(tmp_path):
@@ -99,6 +118,112 @@ def test_external_skill_file_symlink_is_ignored(tmp_path):
         pytest.skip("symlink creation is unavailable on this platform")
 
     assert "leak" not in discover_skills([skills_dir])
+
+
+def test_discovery_rejects_content_from_a_mismatched_open_handle(
+    tmp_path, monkeypatch
+):
+    skills_dir = tmp_path / "skills"
+    skill_dir = make_skill(skills_dir, "safe", "safe description")
+    secret = tmp_path / "outside-secret.txt"
+    secret.write_text(
+        "---\nname: leak\ndescription: private discovery secret\n---\n",
+        encoding="utf-8",
+    )
+
+    def mismatched_open(_root, _relative, mode, *, label, **kwargs):
+        del label
+        return secret.open(mode, **kwargs)
+
+    monkeypatch.setattr(skill_loader, "open_confined", mismatched_open)
+
+    assert parse_skill_md(skill_dir / "SKILL.md", root=skills_dir) is None
+
+
+@pytest.mark.asyncio
+async def test_skill_swap_after_discovery_cannot_read_external_file(tmp_path):
+    skills_dir = tmp_path / "skills"
+    skill_dir = make_skill(skills_dir, "safe", "safe instructions")
+    skills = discover_skills([skills_dir])
+    secret = tmp_path / "outside-secret.txt"
+    secret.write_text("post-discovery-secret", encoding="utf-8")
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.unlink()
+    try:
+        skill_file.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this platform")
+
+    config = Config(cwd=tmp_path)
+    result = await SkillTool(skills).run(
+        {"name": "safe"},
+        ToolContext(cwd=tmp_path, config=config, ui=FakeUI()),
+    )
+
+    assert result.is_error is True
+    assert "post-discovery-secret" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_skill_content_change_after_discovery_is_rejected_portably(tmp_path):
+    skills_dir = tmp_path / "skills"
+    skill_dir = make_skill(skills_dir, "safe", "safe instructions")
+    skills = discover_skills([skills_dir])
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: safe\ndescription: changed\n---\nportable-swap-secret",
+        encoding="utf-8",
+    )
+
+    config = Config(cwd=tmp_path)
+    result = await SkillTool(skills).run(
+        {"name": "safe"},
+        ToolContext(cwd=tmp_path, config=config, ui=FakeUI()),
+    )
+
+    assert result.is_error is True
+    assert "portable-swap-secret" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_skill_root_replacement_is_rejected_portably(tmp_path):
+    skills_dir = tmp_path / "skills"
+    make_skill(skills_dir, "safe", "safe instructions")
+    skills = discover_skills([skills_dir])
+    skills_dir.rename(tmp_path / "original-skills")
+    make_skill(skills_dir, "safe", "replacement", body="replacement-root-secret")
+
+    config = Config(cwd=tmp_path)
+    result = await SkillTool(skills).run(
+        {"name": "safe"},
+        ToolContext(cwd=tmp_path, config=config, ui=FakeUI()),
+    )
+
+    assert result.is_error is True
+    assert "replacement-root-secret" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_skill_root_swap_after_discovery_is_rejected(tmp_path):
+    skills_dir = tmp_path / "skills"
+    make_skill(skills_dir, "safe", "safe instructions")
+    skills = discover_skills([skills_dir])
+    moved = tmp_path / "original-skills"
+    skills_dir.rename(moved)
+    outside = tmp_path / "outside"
+    make_skill(outside, "safe", "outside secret", body="root-swap-secret")
+    try:
+        skills_dir.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this platform")
+
+    config = Config(cwd=tmp_path)
+    result = await SkillTool(skills).run(
+        {"name": "safe"},
+        ToolContext(cwd=tmp_path, config=config, ui=FakeUI()),
+    )
+
+    assert result.is_error is True
+    assert "root-swap-secret" not in result.content
 
 
 def test_index_text(tmp_path):

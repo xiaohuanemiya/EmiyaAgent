@@ -27,16 +27,18 @@ class UsageTracker:
             self.last_usage = usage
 
     def last_for(self, route: str, *, scope: str = "main") -> Usage:
-        """指定路由最近一次请求的 usage（压缩触发必须用执行器自己的，
-        不能用全局 last_usage —— 会被翻译/压缩等其他角色的调用覆盖）。"""
+        """Return one route's latest usage inside an execution scope.
+
+        Compaction reads the executor's ``main`` scope.  Delegated and internal
+        subagents use distinct scopes so even an identical model route cannot
+        replace the executor sample that controls compaction.
+        """
         return self._last_per_scope_route.get(scope, {}).get(route, Usage())
 
     def total(self, *, scope: str | None = None) -> Usage:
         total = Usage()
         source = (
-            self._per_route
-            if scope is None
-            else self._per_scope_route.get(scope, {})
+            self._per_route if scope is None else self._per_scope_route.get(scope, {})
         )
         for u in source.values():
             total = total + u
@@ -46,9 +48,7 @@ class UsageTracker:
         """按配置单价估算累计费用（USD）。"""
         cost = 0.0
         source = (
-            self._per_route
-            if scope is None
-            else self._per_scope_route.get(scope, {})
+            self._per_route if scope is None else self._per_scope_route.get(scope, {})
         )
         for route, u in source.items():
             info = self._config.model_info(route)

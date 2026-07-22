@@ -32,6 +32,8 @@ INVALID_STOP_NOTE = (
     "stop_reason={stop_reason!r}, not 'tool_use'"
 )
 APPROVAL_PREVIEW_CHARS = 8_000
+PARALLEL_CANCEL_GRACE_SECONDS = 2.0
+PARALLEL_CANCEL_FORCE_SECONDS = 0.5
 
 
 def _args_brief(
@@ -110,6 +112,87 @@ def _is_strict_json(value: object, ancestors: set[int] | None = None) -> bool:
         )
     finally:
         seen.remove(identity)
+
+
+def _current_task_is_cancelling() -> bool:
+    """Whether this coroutine's owner received a real ``Task.cancel()``."""
+
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+def _consume_future_result(future: asyncio.Future[object]) -> None:
+    """Retrieve a detached cleanup result so asyncio does not log it later."""
+
+    try:
+        future.result()
+    except BaseException:
+        pass
+
+
+async def _cancel_and_settle_parallel_tasks(
+    tasks: list[asyncio.Task[ToolResultBlock]],
+) -> bool:
+    """Cancel an owned batch and reap it within two bounded grace periods.
+
+    A child task that raises ``CancelledError`` does not make ``gather`` cancel
+    its siblings.  Returning before those siblings finish cancellation would
+    let tool or PostToolUse work continue after paired interruption results have
+    already entered history.  A second cancellation is used after the normal
+    cleanup grace period so a task stuck in an async ``finally`` cannot make the
+    owning AgentLoop uninterruptible forever.
+    """
+
+    def cancel_pending() -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    async def wait_until(
+        settlement: asyncio.Future[list[ToolResultBlock | BaseException]],
+        deadline: float,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        while not settlement.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(settlement), timeout=remaining
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                return settlement.done()
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # Repeated user cancellation escalates to every child while
+                # preserving the fixed deadline for this cleanup phase.
+                cancel_pending()
+        return True
+
+    cancel_pending()
+    settlement = asyncio.gather(*tasks, return_exceptions=True)
+    loop = asyncio.get_running_loop()
+    settled = await wait_until(
+        settlement, loop.time() + PARALLEL_CANCEL_GRACE_SECONDS
+    )
+    if not settled:
+        cancel_pending()
+        settled = await wait_until(
+            settlement, loop.time() + PARALLEL_CANCEL_FORCE_SECONDS
+        )
+
+    if settled:
+        _consume_future_result(settlement)
+        return True
+
+    # A coroutine can deliberately catch every CancelledError; asyncio has no
+    # safe hard-kill primitive.  Do not make the whole AgentLoop immortal.  A
+    # final cancellation plus result consumer prevents unobserved exceptions if
+    # the read-only task eventually exits.
+    cancel_pending()
+    settlement.add_done_callback(_consume_future_result)
+    return False
+
 
 # 渲染回调：消费一次流式请求，返回 MessageDone（REPL 注入 StreamRenderer.render）
 RenderFn = Callable[..., Awaitable[MessageDone]]
@@ -209,9 +292,19 @@ class AgentLoop:
             )
             try:
                 done = await self.render(self.provider.stream(req))
-            except (KeyboardInterrupt, asyncio.CancelledError):
+            except asyncio.CancelledError:
+                if _current_task_is_cancelling():
+                    raise
+                # A provider/renderer may use CancelledError as an internal
+                # interruption signal without cancelling this AgentLoop task.
+                return LoopResult(final_text="", stop_reason="interrupted")
+            except KeyboardInterrupt:
                 # 流式中被打断：assistant 消息未提交，历史保持合法
                 return LoopResult(final_text="", stop_reason="interrupted")
+            if _current_task_is_cancelling():
+                # A provider is allowed to clean up, but must not erase its
+                # caller's cancellation request by suppressing CancelledError.
+                raise asyncio.CancelledError
 
             self.on_usage(self.route, done.usage)
             if self.controller is not None:
@@ -294,11 +387,18 @@ class AgentLoop:
             if not calls:  # 声称 tool_use 却没有调用块：按结束处理
                 return last
 
-            results, interrupted = await self._execute_calls(calls, ctx)
+            results, interrupted, externally_cancelled = await self._execute_calls(
+                calls, ctx
+            )
             user_msg = Message(role="user", content=list(results))
             messages.append(user_msg)
-            self.on_message(user_msg)
-
+            try:
+                self.on_message(user_msg)
+            finally:
+                if externally_cancelled:
+                    # The paired synthetic results above must enter history
+                    # before exposing cancellation to the owning lifecycle.
+                    raise asyncio.CancelledError
             if interrupted or ctx.cancel.is_set():
                 return LoopResult(final_text=last.final_text, stop_reason="interrupted")
 
@@ -424,10 +524,18 @@ class AgentLoop:
         )
 
     async def _dispatch_with_hooks(
-        self, call: ToolUseBlock, ctx: ToolContext
+        self,
+        call: ToolUseBlock,
+        ctx: ToolContext,
+        *,
+        cancellation_barrier: asyncio.Event | None = None,
     ) -> ToolResultBlock:
         started = time.monotonic()
         result = await self.tools.dispatch(call, ctx)
+        if cancellation_barrier is not None and cancellation_barrier.is_set():
+            # A cancellation-resistant read may return after its batch already
+            # timed out.  Never run PostToolUse hooks in that detached state.
+            raise asyncio.CancelledError
         duration_ms = max(0, round((time.monotonic() - started) * 1000))
         return await self._post_hook(
             call, result, ctx, duration_ms=duration_ms
@@ -435,10 +543,15 @@ class AgentLoop:
 
     async def _execute_calls(
         self, calls: list[ToolUseBlock], ctx: ToolContext
-    ) -> tuple[list[ToolResultBlock], bool]:
-        """执行一批调用。返回 (结果列表——与 calls 一一对应, 是否被中断)。"""
+    ) -> tuple[list[ToolResultBlock], bool, bool]:
+        """执行一批调用。
+
+        返回 (与 calls 一一对应的结果, 是否被中断,
+        是否由当前 asyncio Task 的外部取消触发)。
+        """
         results: dict[str, ToolResultBlock] = {}
-        interrupted = False
+        externally_cancelled = _current_task_is_cancelling()
+        interrupted = externally_cancelled
 
         # Read-only/non-interactive calls may still be preflighted together and
         # dispatched concurrently. Stateful serial calls are deliberately not
@@ -454,13 +567,22 @@ class AgentLoop:
             else []
         )
         for call in parallel_candidates:
+            if _current_task_is_cancelling():
+                externally_cancelled = True
+                interrupted = True
+                break
             if ctx.cancel.is_set():
                 interrupted = True
                 break
             try:
                 prepared[call.id] = await self._prepare_call(call, ctx)
+                if _current_task_is_cancelling():
+                    externally_cancelled = True
+                    interrupted = True
+                    break
             except (KeyboardInterrupt, asyncio.CancelledError):
                 interrupted = True
+                externally_cancelled = _current_task_is_cancelling()
                 break
 
         parallel = [
@@ -471,23 +593,62 @@ class AgentLoop:
         serial = [c for c in calls if c not in parallel]
 
         if parallel and not interrupted and not ctx.cancel.is_set():
-            try:
-                done_list = await asyncio.gather(
-                    *(self._dispatch_with_hooks(c, ctx) for c in parallel)
+            parallel_cancelled = asyncio.Event()
+            parallel_tasks = [
+                asyncio.create_task(
+                    self._dispatch_with_hooks(
+                        call,
+                        ctx,
+                        cancellation_barrier=parallel_cancelled,
+                    )
                 )
+                for call in parallel
+            ]
+            parallel_batch = asyncio.gather(*parallel_tasks)
+            try:
+                # Keep ownership of child cancellation here. If this task is
+                # cancelled, gather must not detach or repeatedly cancel tools
+                # while their finally/PostToolUse cleanup is still running.
+                done_list = await asyncio.shield(parallel_batch)
                 for call, res in zip(parallel, done_list):
                     results[call.id] = res
                     self._observe_tool_result(call, res)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 interrupted = True
+                externally_cancelled = _current_task_is_cancelling()
+                parallel_cancelled.set()
+                settled = await _cancel_and_settle_parallel_tasks(parallel_tasks)
+                if not settled:
+                    self._notify(
+                        ctx,
+                        "Parallel tool cleanup exceeded its cancellation deadline; "
+                        "the batch was interrupted and paired with error results.",
+                    )
+                externally_cancelled = (
+                    externally_cancelled or _current_task_is_cancelling()
+                )
+                # ``parallel_batch`` may have completed with a child's
+                # CancelledError while the settlement gather reaped siblings.
+                if parallel_batch.done():
+                    _consume_future_result(parallel_batch)
+                else:
+                    parallel_batch.add_done_callback(_consume_future_result)
 
         for call in serial:
+            if _current_task_is_cancelling():
+                externally_cancelled = True
+                interrupted = True
+                break
             if interrupted or ctx.cancel.is_set():
                 break
             try:
                 decision_info = prepared.get(call.id)
                 if decision_info is None:
                     decision_info = await self._prepare_call(call, ctx)
+                    if _current_task_is_cancelling():
+                        externally_cancelled = True
+                        interrupted = True
+                        break
                 decision, reason, hook_denied = decision_info
                 if decision == "deny":
                     content = (
@@ -526,6 +687,11 @@ class AgentLoop:
                         results[call.id] = res
                         self._observe_tool_result(call, res)
                         continue
+                    if _current_task_is_cancelling():
+                        await self._cancel_approval_state(call, ctx)
+                        externally_cancelled = True
+                        interrupted = True
+                        break
                     try:
                         approved = await ctx.ui.confirm_tool(
                             call.name,
@@ -549,6 +715,11 @@ class AgentLoop:
                         results[call.id] = res
                         self._observe_tool_result(call, res)
                         continue
+                    if _current_task_is_cancelling():
+                        await self._cancel_approval_state(call, ctx)
+                        externally_cancelled = True
+                        interrupted = True
+                        break
                     if approved is not True:
                         await self._cancel_approval_state(call, ctx)
                         res = ToolResultBlock(
@@ -560,8 +731,13 @@ class AgentLoop:
                 res = await self._dispatch_with_hooks(call, ctx)
                 results[call.id] = res
                 self._observe_tool_result(call, res)
+                if _current_task_is_cancelling():
+                    externally_cancelled = True
+                    interrupted = True
+                    break
             except (KeyboardInterrupt, asyncio.CancelledError):
                 interrupted = True
+                externally_cancelled = _current_task_is_cancelling()
                 break
 
         # 不变量 1：为所有未执行的调用补合成结果
@@ -574,4 +750,8 @@ class AgentLoop:
                     tool_use_id=call.id, content=INTERRUPTED_NOTE, is_error=True
                 )
             out.append(res)
-        return out, interrupted or ctx.cancel.is_set()
+        return (
+            out,
+            interrupted or ctx.cancel.is_set(),
+            externally_cancelled or _current_task_is_cancelling(),
+        )

@@ -154,13 +154,24 @@ async def test_chunked_summarize_fallback():
 
 
 def test_serialize_includes_tools_excludes_thinking():
-    from emiya_agent.types import ThinkingBlock
+    from emiya_agent.types import (
+        FallbackBlock,
+        RedactedThinkingBlock,
+        ThinkingBlock,
+    )
 
     messages = [
         Message(
             role="assistant",
             content=[
                 ThinkingBlock(thinking="secret reasoning", signature="s"),
+                RedactedThinkingBlock(data="opaque-redacted-reasoning"),
+                FallbackBlock(
+                    data={
+                        "from": {"model": "secret-source-model"},
+                        "to": {"model": "secret-target-model"},
+                    }
+                ),
                 TextBlock(text="visible"),
                 ToolUseBlock(id="t1", name="grep", input={"pattern": "foo"}),
             ],
@@ -175,3 +186,5 @@ def test_serialize_includes_tools_excludes_thinking():
     assert "grep" in text
     assert "[tool_error] match" in text
     assert "secret reasoning" not in text
+    assert "opaque-redacted-reasoning" not in text
+    assert "secret-source-model" not in text
