@@ -42,7 +42,7 @@ Changelog = "https://github.com/xiaohuanemiya/EmiyaAgent/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
-    "ruff>=0.15.22",
+    "ruff>=0.16.0",
 ]
 
 [build-system]
